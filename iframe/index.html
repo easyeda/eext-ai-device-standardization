@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="zh-Hans">
+	<head>
+		<title data-i18n="AI器件标准化">AI器件标准化</title>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+		<link rel="stylesheet" href="/iframe/style.css">
+	</head>
+	<body>
+		<header class="header">
+			<div class="header-left">
+				<div class="logo-icon">⚡</div>
+				<span class="header-title" data-i18n="AI器件标准化">AI器件标准化</span>
+				<span class="header-badge">EasyEDA</span>
+			</div>
+			<div class="header-actions">
+				<button type="button" class="btn btn-outline btn-sm" data-i18n="清空" onclick="window.__app.clearAll()">🗑 清空</button>
+				<button type="button" class="btn btn-primary btn-sm" id="btnExport" disabled data-i18n="导出" onclick="window.__app.exportResult()">📥 导出</button>
+			</div>
+		</header>
+		<div class="main-container">
+			<div class="content-area">
+				<!-- 模式选择卡片 -->
+				<div class="mode-cards" id="modeCards">
+					<div class="mode-card" onclick="window.__app.startFromSchematic()">
+						<div class="mode-card-icon">⚡</div>
+						<div class="mode-card-title" data-i18n="通过原理图匹配">通过原理图匹配</div>
+						<div class="mode-card-desc" data-i18n="自动读取当前原理图的器件数据，按位号匹配立创器件库">自动读取当前原理图的器件数据，按位号匹配立创器件库</div>
+						<label class="mode-card-toggle" onclick="event.stopPropagation()">
+							<input type="checkbox" id="getAllPages"> <span data-i18n="获取全部图页器件">获取全部图页器件</span>
+						</label>
+					</div>
+					<div class="mode-card" onclick="document.getElementById('fileInput').click()">
+						<div class="mode-card-icon">📁</div>
+						<div class="mode-card-title" data-i18n="通过BOM匹配">通过BOM匹配</div>
+						<div class="mode-card-desc" data-i18n="上传外部 BOM 文件（CSV/XLSX），按位号关联原理图器件后匹配">上传外部 BOM 文件（CSV/XLSX），按位号关联原理图器件后匹配</div>
+					</div>
+					<input type="file" id="fileInput" accept=".csv,.xlsx,.xls" title="选择BOM文件" class="hidden" onchange="window.__app.handleFileSelect(event)">
+				</div>
+				<div class="toolbar hidden" id="toolbar">
+					<input type="text" class="search-input" id="searchInput" data-i18n-placeholder="🔍 搜索位号/型号..." placeholder="🔍 搜索位号/型号..." oninput="window.__app.filterTable()">
+					<button type="button" class="btn btn-outline btn-sm" data-i18n="匹配依据列" onclick="window.__app.openMatchColumnsModal()">🔧 匹配依据列</button>
+					<span id="matchColumnsTags" class="match-tags"></span>
+					<button type="button" class="btn btn-primary btn-sm" id="btnMatch" data-i18n="匹配" onclick="window.__app.matchAll()">🔄 匹配</button>
+					<button type="button" class="btn btn-outline btn-sm" data-i18n="设置" onclick="window.__app.openSettingsModal()">⚙️ 设置</button>
+					<button type="button" class="btn btn-success btn-sm" id="btnBatchBind" data-i18n="批量绑定" onclick="window.__app.batchBind()" disabled>✅ 批量绑定</button>
+					<div class="zoom-control">
+						<span>🔍</span>
+						<input type="range" id="zoomSlider" title="表格缩放" min="60" max="140" value="100" step="5" oninput="window.__app.updateZoom()">
+						<span id="zoomValue">100%</span>
+					</div>
+					<div class="toolbar-stats">
+						<label class="stat-filter"><input type="checkbox" id="filterBound" checked onchange="window.__app.filterByStatus()"> <span data-i18n="已绑定">已绑定</span>:<strong id="statBound">0</strong></label>
+						<label class="stat-filter"><input type="checkbox" id="filterPending" checked onchange="window.__app.filterByStatus()"> <span data-i18n="待绑定">待绑定</span>:<strong id="statPending">0</strong></label>
+						<label class="stat-filter"><input type="checkbox" id="filterUnmatched" checked onchange="window.__app.filterByStatus()"> <span data-i18n="未匹配">未匹配</span>:<strong id="statUnmatched">0</strong></label>
+						<span data-i18n="总计">总计</span>:<strong id="statTotal">0</strong>
+					</div>
+				</div>
+			<!-- 进度条 -->
+				<div class="progress-bar hidden" id="progressBar">
+					<div class="progress-track">
+						<div class="progress-fill" id="progressFill"></div>
+					</div>
+					<span class="progress-text" id="progressText" data-i18n="匹配中...">匹配中...</span>
+				</div>
+				<div class="table-container hidden" id="tableContainer">
+					<div class="table-wrapper" id="tableWrapper">
+						<table id="bomTable">
+							<thead>
+								<tr>
+									<th><input type="checkbox" id="selectAllCheckbox" title="全选" onchange="window.__app.toggleSelectAll()"></th>
+									<th data-i18n="位号">位号</th>
+									<th data-i18n="型号">型号</th>
+									<th data-i18n="数量">数量</th>
+									<th data-i18n="封装">封装</th>
+									<th data-i18n="匹配结果">匹配结果</th>
+									<th data-i18n="匹配度">匹配度</th>
+									<th data-i18n="绑定">绑定</th>
+									<th data-i18n="操作">操作</th>
+								</tr>
+							</thead>
+							<tbody id="tableBody"></tbody>
+						</table>
+						<div class="empty-state" id="emptyState" data-i18n="📭 暂无数据">📭 暂无数据</div>
+					</div>
+				</div>
+				<div class="status-bar" id="statusBar">
+					<span id="statusText"><span class="status-dot disconnected"></span> <span data-i18n="初始化中...">初始化中...</span></span>
+				</div>
+			</div>
+			<aside class="detail-panel collapsed" id="detailPanel">
+				<div class="panel-inner">
+					<div class="panel-empty" id="panelEmpty" data-i18n="📋 点击器件查看详情">📋 点击器件查看详情</div>
+					<div class="panel-content hidden" id="panelContent"></div>
+				</div>
+			</aside>
+		</div>
+		<div class="toast-container" id="toastContainer"></div>
+		<div id="modalContainer"></div>
+
+		<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+		<script src="/iframe/app.js"></script>
+	</body>
+</html>

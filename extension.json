@@ -1,0 +1,45 @@
+{
+	"name": "eext-ai-device-standardization",
+	"uuid": "b59a8c040a9243209a37281268484a31",
+	"displayName": "AI器件标准化",
+	"description": "AI自动匹配器件信息、符号、封装，支持一键绑定、批量操作",
+	"version": "1.6.1",
+	"publisher": "",
+	"engines": {
+		"eda": "^3.0.0"
+	},
+	"license": "Apache-2.0",
+	"repository": {
+		"type": "github",
+		"url": "https://github.com/easyeda/eext-ai-device-standardization"
+	},
+	"categories": "Other",
+	"keywords": [
+		"Tool",
+		"BOM",
+		"Package"
+	],
+	"images": {
+		"logo": "./images/logo.png"
+	},
+	"homepage": "https://github.com/easyeda",
+	"bugs": "https://github.com/easyeda/eext-ai-device-standardization/issues",
+	"activationEvents": {},
+	"entry": "./dist/index",
+	"dependentExtensions": {},
+	"headerMenus": {
+		"sch": [
+			{
+				"id": "bomSmartMatch",
+				"title": "AI器件标准化",
+				"menuItems": [
+					{
+						"id": "openBomMatcher",
+						"title": "打开",
+						"registerFn": "openBomMatcher"
+					}
+				]
+			}
+		]
+	}
+}
