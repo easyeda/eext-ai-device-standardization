@@ -39,6 +39,7 @@
 				</div>
 				<div class="toolbar hidden" id="toolbar">
 					<input type="text" class="search-input" id="searchInput" data-i18n-placeholder="🔍 搜索位号/型号..." placeholder="🔍 搜索位号/型号..." oninput="window.__app.filterTable()">
+					<select id="librarySelect" class="search-input library-select" title="选择匹配库" onchange="window.__app.onLibraryChange(this.value)"></select>
 					<button type="button" class="btn btn-outline btn-sm" data-i18n="匹配依据列" onclick="window.__app.openMatchColumnsModal()">🔧 匹配依据列</button>
 					<span id="matchColumnsTags" class="match-tags"></span>
 					<button type="button" class="btn btn-primary btn-sm" id="btnMatch" data-i18n="匹配" onclick="window.__app.matchAll()">🔄 匹配</button>
@@ -66,19 +67,7 @@
 				<div class="table-container hidden" id="tableContainer">
 					<div class="table-wrapper" id="tableWrapper">
 						<table id="bomTable">
-							<thead>
-								<tr>
-									<th><input type="checkbox" id="selectAllCheckbox" title="全选" onchange="window.__app.toggleSelectAll()"></th>
-									<th data-i18n="位号">位号</th>
-									<th data-i18n="型号">型号</th>
-									<th data-i18n="数量">数量</th>
-									<th data-i18n="封装">封装</th>
-									<th data-i18n="匹配结果">匹配结果</th>
-									<th data-i18n="匹配度">匹配度</th>
-									<th data-i18n="绑定">绑定</th>
-									<th data-i18n="操作">操作</th>
-								</tr>
-							</thead>
+							<thead id="tableHead"></thead>
 							<tbody id="tableBody"></tbody>
 						</table>
 						<div class="empty-state" id="emptyState" data-i18n="📭 暂无数据">📭 暂无数据</div>

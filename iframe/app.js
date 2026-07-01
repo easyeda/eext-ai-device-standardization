@@ -20,14 +20,44 @@
 	let bomColumns = []; // BOM 原始列名
 
 	let matchColumns = []; // 匹配依据列（多选）
+	let matchTarget = 'device'; // 匹配目标：'device'=器件库, 'symbol'=符号库, 'footprint'=封装库
+	let libraryList = []; // 库列表 [{name, uuid}]
+	let specialLibraries = []; // 特殊库 [{name, uuid}]（收藏/个人/工程/系统）
+	let selectedLibraryUuid = ''; // 选中的库 UUID（空=全部库）
 	const expandedDesignatorSets = new Set();
 	const designatorToPrimitiveId = {}; // 位号 → primitiveId 映射（用于绑定）
 	const searchCache = {}; // 搜索结果缓存 { keyword: results }
 	let currentEditingKey = ''; // 当前编辑的分组 key
 	const aiSettings = { enabled: false, apiUrl: '', apiKey: '', model: 'gpt-4o-mini', batchSend: false, contextSize: 128 }; // AI 设置（contextSize 单位: K tokens）
-	let bindMode = 'replace'; // 绑定模式：'footprint'=只绑定封装, 'symbol'=只绑定符号, 'replace'=替换器件, 'data'=替换数据
+	// 绑定选项（三个复选框）
+	let bindOptions = {
+		keepDesignatorId: true,  // 保留位号和唯一ID
+		keepSymbol: true,        // 保留当前符号
+		keepFootprint: false,    // 保留当前封装
+	};
+	// 绑定检测逻辑：'fp'=检查EasyEDA封装, 'lcsc'=检查LCSC, 'fp_or_lcsc'=封装或LCSC, 'any'=有器件即可
+	let bindDetectMode = 'fp_or_lcsc';
 	let fallbackFootprintEnabled = false; // 匹配不到器件时降级匹配封装
 	let footprintColumn = ''; // 封装列（从 bomColumns 中选择）
+
+	// ============ 主题管理 ============
+	let themePreference = 'auto'; // 'auto' | 'dark' | 'light'
+	let lastSystemTheme = 'light';
+
+	// ============ 表格列配置 ============
+	let tableColumns = [
+		{ key: 'checkbox', label: '', visible: true, fixed: true, width: 55, sortable: false },
+		{ key: 'designator', label: '位号', visible: true, fixed: false, width: 150, sortable: true },
+		{ key: 'mpn', label: '型号', visible: true, fixed: false, width: 180, sortable: true },
+		{ key: 'qty', label: '数量', visible: true, fixed: false, width: 60, sortable: true },
+		{ key: 'footprint', label: '封装', visible: true, fixed: false, width: 140, sortable: true },
+		{ key: 'matchResult', label: '匹配结果', visible: true, fixed: false, width: 200, sortable: false },
+		{ key: 'matchScore', label: '匹配度', visible: true, fixed: false, width: 100, sortable: true },
+		{ key: 'bindStatus', label: '绑定', visible: true, fixed: false, width: 80, sortable: true },
+		{ key: 'actions', label: '操作', visible: true, fixed: true, width: 200, sortable: false },
+	];
+	let sortState = { key: '', direction: '' }; // direction: 'asc' | 'desc' | ''
+	let columnResizeState = { active: false, colKey: '', startX: 0, startWidth: 0 };
 
 	// ============ DOM 引用 ============
 	const $ = s => document.querySelector(s);
@@ -108,6 +138,538 @@
 		if (titleEl) {
 			document.title = i18n(titleEl.getAttribute('data-i18n'));
 		}
+	}
+
+	// ============ 主题管理 ============
+
+	/** 初始化主题：加载偏好、获取系统主题、启动轮询 */
+	async function initTheme() {
+		try {
+			const saved = await eda.sys_Storage.getExtensionUserConfig('themePreference');
+			if (saved) themePreference = saved;
+		}
+		catch (err) {
+			console.warn(PLUGIN_TAG, 'Failed to load theme preference:', err);
+		}
+		try {
+			lastSystemTheme = await eda.sys_Window.getCurrentTheme();
+		}
+		catch (err) {
+			console.warn(PLUGIN_TAG, 'Failed to get system theme:', err);
+		}
+		applyTheme();
+		// 轮询系统主题（仅 auto 模式）
+		try {
+			eda.sys_Timer.setIntervalTimer('theme-poll', 3000, async () => {
+				if (themePreference !== 'auto') return;
+				try {
+					const t = await eda.sys_Window.getCurrentTheme();
+					if (t !== lastSystemTheme) {
+						lastSystemTheme = t;
+						applyTheme();
+					}
+				}
+				catch (err) {
+					console.warn(PLUGIN_TAG, 'Theme poll failed:', err);
+				}
+			});
+		}
+		catch (err) {
+			console.warn(PLUGIN_TAG, 'Failed to start theme poll timer:', err);
+		}
+	}
+
+	/** 应用主题到 DOM */
+	function applyTheme() {
+		const theme = themePreference === 'auto' ? lastSystemTheme : themePreference;
+		document.documentElement.dataset.theme = theme;
+		const btn = document.getElementById('btnTheme');
+		if (btn) btn.textContent = theme === 'dark' ? '☀️' : '🌙';
+	}
+
+	/** 切换主题偏好 */
+	async function toggleTheme() {
+		if (themePreference === 'auto') {
+			// 当前跟随系统 → 手动切到相反主题
+			themePreference = lastSystemTheme === 'dark' ? 'light' : 'dark';
+		}
+		else {
+			// 当前手动 → 恢复跟随系统
+			themePreference = 'auto';
+			try {
+				lastSystemTheme = await eda.sys_Window.getCurrentTheme();
+			}
+			catch (err) {
+				console.warn(PLUGIN_TAG, 'Failed to get system theme on toggle:', err);
+			}
+		}
+		try {
+			await eda.sys_Storage.setExtensionUserConfig('themePreference', themePreference);
+		}
+		catch (err) {
+			console.warn(PLUGIN_TAG, 'Failed to save theme preference:', err);
+		}
+		applyTheme();
+	}
+
+	// ============ 表格列配置 ============
+
+	/** 加载列配置 */
+	async function loadColumnConfig() {
+		try {
+			const saved = await eda.sys_Storage.getExtensionUserConfig('tableColumnConfig');
+			if (saved) {
+				const parsed = JSON.parse(saved);
+				if (Array.isArray(parsed)) {
+					// 恢复自定义列
+					const savedCustom = parsed.filter(c => c.key.startsWith('custom_'));
+					for (const sc of savedCustom) {
+						if (!tableColumns.find(c => c.key === sc.key)) {
+							// 在 actions 列之前插入
+							const actionsIdx = tableColumns.findIndex(c => c.key === 'actions');
+							tableColumns.splice(actionsIdx, 0, {
+								key: sc.key,
+								label: sc.label,
+								visible: sc.visible !== undefined ? sc.visible : true,
+								fixed: false,
+								width: sc.width || 120,
+								sortable: true,
+							});
+						}
+					}
+
+					// 恢复列顺序和配置
+					const reordered = [];
+					for (const savedCol of parsed) {
+						const col = tableColumns.find(c => c.key === savedCol.key);
+						if (col) {
+							col.visible = savedCol.visible !== undefined ? savedCol.visible : col.visible;
+							col.width = savedCol.width || col.width;
+							reordered.push(col);
+						}
+					}
+					// 添加新列（不在保存配置中的）
+					for (const col of tableColumns) {
+						if (!reordered.find(c => c.key === col.key)) {
+							reordered.push(col);
+						}
+					}
+					tableColumns.length = 0;
+					tableColumns.push(...reordered);
+				}
+			}
+		}
+		catch (err) {
+			console.warn(PLUGIN_TAG, 'Failed to load column config:', err);
+		}
+	}
+
+	/** 保存列配置 */
+	async function saveColumnConfig() {
+		try {
+			await eda.sys_Storage.setExtensionUserConfig('tableColumnConfig', JSON.stringify(tableColumns));
+		}
+		catch (err) {
+			console.warn(PLUGIN_TAG, 'Failed to save column config:', err);
+		}
+	}
+
+	/** 动态渲染表头 */
+	function renderTableHead() {
+		const thead = document.getElementById('tableHead');
+		if (!thead) return;
+		const visibleCols = tableColumns.filter(c => c.visible);
+		let html = '<tr>';
+		for (const col of visibleCols) {
+			const style = `width:${col.width}px;min-width:${col.width}px;`;
+			const sortClass = sortState.key === col.key ? ' sort-active' : '';
+			if (col.key === 'checkbox') {
+				html += `<th style="${style}"><span class="th-columns-btn" onclick="window.__app.openColumnConfigModal()" title="${i18n('列设置')}">⚙</span> <input type="checkbox" id="selectAllCheckbox" title="${i18n('全选')}" onchange="window.__app.toggleSelectAll()"></th>`;
+			}
+			else {
+				const sortIndicator = col.sortable ? `<span class="sort-indicator">${sortState.key === col.key ? (sortState.direction === 'asc' ? '▲' : '▼') : '▲'}</span>` : '';
+				const onclick = col.sortable ? `onclick="window.__app.toggleColumnSort('${col.key}')"` : '';
+				const resizeHandle = !col.fixed ? `<span class="col-resize-handle" data-col="${col.key}"></span>` : '';
+				const draggable = !col.fixed ? 'draggable="true"' : '';
+				const dragEvents = !col.fixed ? `ondragstart="window.__app.onColumnDragStart(event,'${col.key}')" ondragover="window.__app.onColumnDragOver(event)" ondragenter="window.__app.onColumnDragEnter(event,'${col.key}')" ondragleave="window.__app.onColumnDragLeave(event)" ondrop="window.__app.onColumnDrop(event,'${col.key}')" ondragend="window.__app.onColumnDragEnd(event)"` : '';
+				html += `<th style="${style}" class="${sortClass}" ${onclick} ${draggable} ${dragEvents} data-col="${col.key}" data-i18n="${col.label}">${i18n(col.label)}${sortIndicator}${resizeHandle}</th>`;
+			}
+		}
+		html += '</tr>';
+		thead.innerHTML = html;
+		// 绑定列宽拖拽事件
+		initColumnResize();
+	}
+
+	/** 初始化列宽拖拽 */
+	function initColumnResize() {
+		document.querySelectorAll('.col-resize-handle').forEach((handle) => {
+			handle.addEventListener('mousedown', (e) => {
+				e.preventDefault();
+				e.stopPropagation();
+				const colKey = handle.dataset.col;
+				const col = tableColumns.find(c => c.key === colKey);
+				if (!col) return;
+				columnResizeState = { active: true, colKey, startX: e.clientX, startWidth: col.width };
+				handle.classList.add('active');
+				document.addEventListener('mousemove', onColumnResizeMove);
+				document.addEventListener('mouseup', onColumnResizeEnd);
+			});
+		});
+	}
+
+	function onColumnResizeMove(e) {
+		if (!columnResizeState.active) return;
+		const diff = e.clientX - columnResizeState.startX;
+		const newWidth = Math.max(40, columnResizeState.startWidth + diff);
+		const col = tableColumns.find(c => c.key === columnResizeState.colKey);
+		if (col) {
+			col.width = newWidth;
+			// 更新对应列的 th 宽度
+			const ths = document.querySelectorAll('#tableHead th');
+			const visibleCols = tableColumns.filter(c => c.visible);
+			const idx = visibleCols.findIndex(c => c.key === columnResizeState.colKey);
+			if (idx >= 0 && ths[idx]) {
+				ths[idx].style.width = `${newWidth}px`;
+				ths[idx].style.minWidth = `${newWidth}px`;
+			}
+		}
+	}
+
+	function onColumnResizeEnd() {
+		columnResizeState.active = false;
+		document.querySelectorAll('.col-resize-handle').forEach(h => h.classList.remove('active'));
+		document.removeEventListener('mousemove', onColumnResizeMove);
+		document.removeEventListener('mouseup', onColumnResizeEnd);
+		saveColumnConfig();
+	}
+
+	// ============ 表头拖拽排序 ============
+	let dragSourceColKey = '';
+
+	function onColumnDragStart(e, key) {
+		dragSourceColKey = key;
+		e.dataTransfer.effectAllowed = 'move';
+		e.target.classList.add('dragging');
+	}
+
+	function onColumnDragOver(e) {
+		e.preventDefault();
+		e.dataTransfer.dropEffect = 'move';
+	}
+
+	function onColumnDragEnter(e, key) {
+		e.preventDefault();
+		if (key === dragSourceColKey) return;
+		const th = e.target.closest('th');
+		if (th) th.classList.add('drag-over');
+	}
+
+	function onColumnDragLeave(e) {
+		const th = e.target.closest('th');
+		if (th) th.classList.remove('drag-over');
+	}
+
+	function onColumnDrop(e, targetKey) {
+		e.preventDefault();
+		const th = e.target.closest('th');
+		if (th) th.classList.remove('drag-over');
+		if (!dragSourceColKey || dragSourceColKey === targetKey) return;
+		if (dragSourceColKey === 'checkbox' || targetKey === 'checkbox') return;
+		if (dragSourceColKey === 'actions' || targetKey === 'actions') return;
+
+		const srcIdx = tableColumns.findIndex(c => c.key === dragSourceColKey);
+		const tgtIdx = tableColumns.findIndex(c => c.key === targetKey);
+		if (srcIdx < 0 || tgtIdx < 0) return;
+
+		// 移动列位置
+		const [moved] = tableColumns.splice(srcIdx, 1);
+		tableColumns.splice(tgtIdx, 0, moved);
+		saveColumnConfig();
+		renderTableHead();
+		renderTable(searchInput.value);
+	}
+
+	function onColumnDragEnd(e) {
+		e.target.classList.remove('dragging');
+		document.querySelectorAll('th.drag-over').forEach(th => th.classList.remove('drag-over'));
+		dragSourceColKey = '';
+	}
+
+	/** 切换列排序 */
+	function toggleColumnSort(key) {
+		if (sortState.key === key) {
+			// 循环：asc → desc → 取消
+			if (sortState.direction === 'asc') {
+				sortState.direction = 'desc';
+			}
+			else if (sortState.direction === 'desc') {
+				sortState.key = '';
+				sortState.direction = '';
+			}
+		}
+		else {
+			sortState.key = key;
+			sortState.direction = 'asc';
+		}
+		renderTableHead();
+		renderTable(searchInput.value);
+	}
+
+	/** 对数据排序 */
+	function sortData(data) {
+		if (!sortState.key || !sortState.direction) return data;
+		const dir = sortState.direction === 'asc' ? 1 : -1;
+		return [...data].sort((a, b) => {
+			const k = sortState.key;
+			let va, vb;
+			if (k === 'designator') {
+				va = a.designatorStr || '';
+				vb = b.designatorStr || '';
+			}
+			else if (k === 'mpn') {
+				va = a.mpn || '';
+				vb = b.mpn || '';
+			}
+			else if (k === 'qty') {
+				return (a.qty - b.qty) * dir;
+			}
+			else if (k === 'footprint') {
+				va = a.pkg || '';
+				vb = b.pkg || '';
+			}
+			else if (k === 'matchScore') {
+				const ka = a.designatorList.join(',');
+				const kb = b.designatorList.join(',');
+				const mra = matchResults[ka] || {};
+				const mrb = matchResults[kb] || {};
+				const sa = mra.bestMatch ? calcMatchScore(a, mra.bestMatch) : (mra.matchScore || 0);
+				const sb = mrb.bestMatch ? calcMatchScore(b, mrb.bestMatch) : (mrb.matchScore || 0);
+				return (sa - sb) * dir;
+			}
+			else if (k === 'bindStatus') {
+				const ab = a.designatorList.every(d => bindStatus[d]?.bound) ? 1 : 0;
+				const bb = b.designatorList.every(d => bindStatus[d]?.bound) ? 1 : 0;
+				return (ab - bb) * dir;
+			}
+			else if (k.startsWith('custom_')) {
+				// 自定义列排序：从 _raw 中读取
+				const rawKey = k.slice(7);
+				va = a._raw?.[rawKey] || a[rawKey] || '';
+				vb = b._raw?.[rawKey] || b[rawKey] || '';
+			}
+			else {
+				return 0;
+			}
+			// 字符串比较（支持数字混合排序）
+			return va.localeCompare(vb, undefined, { numeric: true, sensitivity: 'base' }) * dir;
+		});
+	}
+
+	/** 打开列配置弹窗 */
+	function openColumnConfigModal() {
+		// 可排序的非固定列（内置 + 自定义）
+		const sortableCols = tableColumns.filter(col => !col.fixed);
+		const sortableHtml = sortableCols
+			.map((col, idx) => {
+				const isCustom = col.key.startsWith('custom_');
+				const removeBtn = isCustom ? `<button class="btn-icon" style="margin-left:auto;font-size:12px;color:var(--danger);" onclick="event.stopPropagation();window.__app.removeCustomColumn('${col.key}')" title="${i18n('移除')}">✕</button>` : '';
+				return `<div class="col-item" draggable="true" data-key="${col.key}" data-idx="${idx}">
+					<span class="col-drag-handle">⠿</span>
+					<input type="checkbox" ${col.visible ? 'checked' : ''} onclick="event.stopPropagation()" onchange="window.__app.toggleColumn('${col.key}', this.checked)">
+					<span>${col.label}</span>
+					${removeBtn}
+				</div>`;
+			}).join('');
+
+		// 可添加的 BOM 列
+		const existingKeys = new Set(tableColumns.map(c => c.key));
+		const availableCols = bomColumns.filter(h => !existingKeys.has('custom_' + h));
+		const addHtml = availableCols.length > 0
+			? `<div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--border);">
+				<div style="font-size:12px;color:var(--text-secondary);margin-bottom:6px;">${i18n('添加BOM数据列')}</div>
+				<div style="display:flex;flex-wrap:wrap;gap:6px;">
+					${availableCols.map(h => `<button class="btn btn-outline btn-xs" onclick="window.__app.addCustomColumn('${h}')">+ ${h}</button>`).join('')}
+				</div>
+			</div>`
+			: '';
+
+		modalContainer.innerHTML = `<div class="modal-overlay">
+			<div class="modal" style="width:400px;">
+				<div class="modal-header">
+					<h3>${i18n('列设置')}</h3>
+					<button class="btn-icon" onclick="this.closest('.modal-overlay').remove()">✕</button>
+				</div>
+				<div class="modal-body">
+					<div style="font-size:12px;color:var(--text-secondary);margin-bottom:8px;">${i18n('拖拽列名可调整顺序')}</div>
+					<div id="colSortList">${sortableHtml}</div>
+					${addHtml}
+					<div style="margin-top:16px;text-align:right;">
+						<button class="btn btn-primary btn-sm" onclick="this.closest('.modal-overlay').remove()">${i18n('完成')}</button>
+					</div>
+				</div>
+			</div>
+		</div>`;
+
+		// 初始化拖拽排序
+		initColumnDragSort();
+	}
+
+	/** 列设置弹窗内的拖拽排序 */
+	function initColumnDragSort() {
+		const list = document.getElementById('colSortList');
+		if (!list) return;
+		let dragItem = null;
+
+		list.querySelectorAll('.col-item').forEach((item) => {
+			item.addEventListener('dragstart', (e) => {
+				dragItem = item;
+				item.classList.add('col-dragging');
+				e.dataTransfer.effectAllowed = 'move';
+				e.dataTransfer.setData('text/plain', item.dataset.key);
+			});
+
+			item.addEventListener('dragend', () => {
+				if (dragItem) dragItem.classList.remove('col-dragging');
+				dragItem = null;
+				list.querySelectorAll('.col-drag-over').forEach(el => el.classList.remove('col-drag-over'));
+			});
+
+			item.addEventListener('dragover', (e) => {
+				e.preventDefault();
+				e.dataTransfer.dropEffect = 'move';
+				if (item !== dragItem) {
+					item.classList.add('col-drag-over');
+				}
+			});
+
+			item.addEventListener('dragleave', () => {
+				item.classList.remove('col-drag-over');
+			});
+
+			item.addEventListener('drop', (e) => {
+				e.preventDefault();
+				item.classList.remove('col-drag-over');
+				if (!dragItem || item === dragItem) return;
+
+				const fromKey = dragItem.dataset.key;
+				const toKey = item.dataset.key;
+				const fromIdx = tableColumns.findIndex(c => c.key === fromKey);
+				const toIdx = tableColumns.findIndex(c => c.key === toKey);
+				if (fromIdx < 0 || toIdx < 0) return;
+
+				// 移动位置
+				const [moved] = tableColumns.splice(fromIdx, 1);
+				tableColumns.splice(toIdx, 0, moved);
+
+				// 刷新弹窗和表格
+				saveColumnConfig();
+				openColumnConfigModal();
+				renderTableHead();
+				renderTable(searchInput.value);
+			});
+		});
+	}
+
+	/** 切换列可见性 */
+	function toggleColumn(key, visible) {
+		const col = tableColumns.find(c => c.key === key);
+		if (col) {
+			col.visible = visible;
+			saveColumnConfig();
+			renderTableHead();
+			renderTable(searchInput.value);
+		}
+	}
+
+	/** 添加自定义 BOM 数据列 */
+	function addCustomColumn(header) {
+		const key = 'custom_' + header;
+		if (tableColumns.find(c => c.key === key)) return;
+		// 在 actions 列之前插入
+		const actionsIdx = tableColumns.findIndex(c => c.key === 'actions');
+		tableColumns.splice(actionsIdx, 0, {
+			key,
+			label: header,
+			visible: true,
+			fixed: false,
+			width: 120,
+			sortable: true,
+		});
+		saveColumnConfig();
+		renderTableHead();
+		renderTable(searchInput.value);
+		openColumnConfigModal(); // 刷新弹窗
+	}
+
+	/** 移除自定义列 */
+	function removeCustomColumn(key) {
+		const idx = tableColumns.findIndex(c => c.key === key);
+		if (idx >= 0) {
+			tableColumns.splice(idx, 1);
+			saveColumnConfig();
+			renderTableHead();
+			renderTable(searchInput.value);
+			openColumnConfigModal(); // 刷新弹窗
+		}
+	}
+
+	// ============ 库列表管理 ============
+
+	/** 加载库列表并填充下拉框 */
+	async function loadLibraryList() {
+		// 获取特殊库 UUID
+		try {
+			specialLibraries = [
+				{ name: i18n('收藏库'), uuid: await eda.lib_LibrariesList.getFavoriteLibraryUuid() || '' },
+				{ name: i18n('个人库'), uuid: await eda.lib_LibrariesList.getPersonalLibraryUuid() || '' },
+				{ name: i18n('工程库'), uuid: await eda.lib_LibrariesList.getProjectLibraryUuid() || '' },
+				{ name: i18n('系统库'), uuid: await eda.lib_LibrariesList.getSystemLibraryUuid() || '' },
+			].filter(l => l.uuid);
+		}
+		catch (err) {
+			console.warn(PLUGIN_TAG, 'Failed to get special libraries:', err);
+		}
+		// 获取全部库列表
+		try {
+			const libs = await eda.lib_LibrariesList.getAllLibrariesList();
+			if (Array.isArray(libs)) {
+				libraryList = libs.map(l => ({ name: l.name || l.friendlyName || '', uuid: l.uuid || '' })).filter(l => l.uuid);
+			}
+		}
+		catch (err) {
+			console.warn(PLUGIN_TAG, 'Failed to load library list:', err);
+		}
+		renderLibrarySelect();
+	}
+
+	/** 渲染库选择下拉框 */
+	function renderLibrarySelect() {
+		const select = document.getElementById('librarySelect');
+		if (!select) return;
+		let html = `<option value="">${i18n('全部库')}</option>`;
+		// 特殊库（分组）
+		if (specialLibraries.length) {
+			html += `<optgroup label="${i18n('快捷库')}">`;
+			for (const lib of specialLibraries) {
+				html += `<option value="${lib.uuid}" ${selectedLibraryUuid === lib.uuid ? 'selected' : ''}>${lib.name}</option>`;
+			}
+			html += `</optgroup>`;
+		}
+		// 全部库列表（分组）
+		if (libraryList.length) {
+			html += `<optgroup label="${i18n('全部库列表')}">`;
+			for (const lib of libraryList) {
+				html += `<option value="${lib.uuid}" ${selectedLibraryUuid === lib.uuid ? 'selected' : ''}>${lib.name}</option>`;
+			}
+			html += `</optgroup>`;
+		}
+		select.innerHTML = html;
+	}
+
+	/** 切换选中库 */
+	function onLibraryChange(uuid) {
+		selectedLibraryUuid = uuid;
 	}
 
 	function showToast(msg, type = 'info') {
@@ -612,17 +1174,28 @@
 		if (!keyword || !keyword.trim())
 			return [];
 		const kw = keyword.trim();
-		if (searchCache[kw])
-			return searchCache[kw];
+		const cacheKey = `${matchTarget}:${selectedLibraryUuid}:${kw}`;
+		if (searchCache[cacheKey])
+			return searchCache[cacheKey];
 
+		const libUuid = selectedLibraryUuid || undefined;
 		try {
-			const results = await eda.lib_Device.search(kw);
+			let results;
+			if (matchTarget === 'symbol') {
+				results = await eda.lib_Symbol.search(kw, libUuid);
+			}
+			else if (matchTarget === 'footprint') {
+				results = await eda.lib_Footprint.search(kw, libUuid);
+			}
+			else {
+				results = await eda.lib_Device.search(kw, libUuid);
+			}
 			const safe = (results || []).map(normalizeDevice).filter(Boolean);
-			searchCache[kw] = safe;
+			searchCache[cacheKey] = safe;
 			return safe;
 		}
 		catch (err) {
-			console.error(PLUGIN_TAG, 'Device search failed for', kw, err);
+			console.error(PLUGIN_TAG, 'Search failed for', kw, 'target:', matchTarget, 'lib:', libUuid, err);
 			return [];
 		}
 	}
@@ -654,9 +1227,14 @@
 			if (raw) {
 				const parsed = JSON.parse(raw);
 				Object.assign(aiSettings, parsed);
-				// 恢复绑定模式
-				if (parsed.bindMode) {
-					bindMode = parsed.bindMode;
+				// 恢复绑定选项
+				if (parsed.bindOptions) {
+					bindOptions.keepDesignatorId = parsed.bindOptions.keepDesignatorId ?? true;
+					bindOptions.keepSymbol = parsed.bindOptions.keepSymbol ?? true;
+					bindOptions.keepFootprint = parsed.bindOptions.keepFootprint ?? false;
+				}
+				if (parsed.bindDetectMode) {
+					bindDetectMode = parsed.bindDetectMode;
 				}
 				// 恢复降级匹配封装设置
 				if (parsed.fallbackFootprintEnabled !== undefined)
@@ -683,72 +1261,96 @@
 
 	/** 打开 AI 设置弹窗 */
 	function openSettingsModal() {
-		const modes = [
-			{ key: 'footprint', label: i18n('只绑定封装'), desc: i18n('仅修改器件的封装关联') },
-			{ key: 'symbol', label: i18n('只绑定符号'), desc: i18n('仅修改器件的符号关联') },
-			{ key: 'replace', label: i18n('替换器件'), desc: i18n('删除旧器件，用匹配的库器件重新创建') },
-			{ key: 'data', label: i18n('替换数据'), desc: i18n('修改器件的名称、制造商等属性，不改变封装') },
-		];
-		const modeOptions = modes.map(m =>
-			`<label class="bind-mode-item" data-key="${m.key}" style="display:flex;align-items:flex-start;gap:8px;padding:8px 12px;border:1px solid ${bindMode === m.key ? 'var(--primary)' : 'var(--border-light)'};border-radius:6px;cursor:pointer;background:${bindMode === m.key ? '#f0f7ff' : 'transparent'};">
-				<input type="radio" name="bindMode" value="${m.key}" ${bindMode === m.key ? 'checked' : ''} style="margin-top:2px;" onchange="window.__app.onBindModeChange('${m.key}')">
-				<div><div style="font-weight:500;font-size:13px;">${m.label}</div><div style="font-size:11px;color:var(--text-muted);margin-top:2px;">${m.desc}</div></div>
-			</label>`,
-		).join('');
-
-		modalContainer.innerHTML = `<div class="modal-overlay" onclick="if(event.target===this)this.remove()">
+		modalContainer.innerHTML = `<div class="modal-overlay">
 			<div class="modal" style="width:480px;">
-				<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+				<div class="modal-header">
 					<h3>${i18n('设置')}</h3>
 					<button class="btn-icon" onclick="this.closest('.modal-overlay').remove()">✕</button>
 				</div>
-				<h4 style="margin-bottom:10px;font-size:14px;">${i18n('AI 匹配设置')}</h4>
-				<div style="margin-bottom:14px;">
-					<label style="font-size:12px;color:var(--text-muted);display:block;margin-bottom:4px;">${i18n('API 地址（OpenAI 格式）')}</label>
-					<input type="text" id="aiApiUrl" value="${aiSettings.apiUrl}" placeholder="https://api.openai.com/v1/chat/completions" style="width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:6px;font-size:13px;">
-				</div>
-				<div style="margin-bottom:14px;">
-					<label style="font-size:12px;color:var(--text-muted);display:block;margin-bottom:4px;">${i18n('API Key')}</label>
-					<input type="password" id="aiApiKey" value="${aiSettings.apiKey}" placeholder="sk-..." style="width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:6px;font-size:13px;">
-				</div>
-				<div style="margin-bottom:14px;">
-					<label style="font-size:12px;color:var(--text-muted);display:block;margin-bottom:4px;">${i18n('模型')}</label>
-					<input type="text" id="aiModel" value="${aiSettings.model}" placeholder="gpt-4o-mini" style="width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:6px;font-size:13px;">
-				</div>
-				<div style="display:flex;align-items:center;gap:8px;margin-bottom:14px;">
-					<input type="checkbox" id="aiEnabled" ${aiSettings.enabled ? 'checked' : ''}>
-					<label style="font-size:13px;cursor:pointer;" onclick="document.getElementById('aiEnabled').click()">${i18n('启用 AI 匹配')}</label>
-				</div>
-				<div style="border-top:1px solid var(--border);margin:4px 0 14px;padding-top:14px;">
-					<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">
-						<input type="checkbox" id="aiBatchSend" ${aiSettings.batchSend ? 'checked' : ''} onchange="document.getElementById('batchSizeRow').style.display=this.checked?'':'none'">
-						<label style="font-size:13px;cursor:pointer;" onclick="document.getElementById('aiBatchSend').click()">${i18n('组合发送（多个器件合并为一次请求）')}</label>
+				<div class="modal-body">
+					<h4 style="margin-bottom:10px;font-size:14px;">${i18n('AI 匹配设置')}</h4>
+					<div style="margin-bottom:14px;">
+						<label style="font-size:12px;color:var(--text-muted);display:block;margin-bottom:4px;">${i18n('API 地址（OpenAI 格式）')}</label>
+						<input type="text" id="aiApiUrl" value="${aiSettings.apiUrl}" placeholder="https://api.openai.com/v1/chat/completions" style="width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:6px;font-size:13px;">
 					</div>
-					<div id="batchSizeRow" style="margin-bottom:10px;${aiSettings.batchSend ? '' : 'display:none;'}">
-						<label style="font-size:12px;color:var(--text-muted);display:block;margin-bottom:4px;">${i18n('模型最大上下文（K tokens）')}</label>
-						<input type="number" id="aiContextSize" value="${aiSettings.contextSize}" min="4" max="10000" placeholder="128" style="width:120px;padding:8px 10px;border:1px solid var(--border);border-radius:6px;font-size:13px;">
+					<div style="margin-bottom:14px;">
+						<label style="font-size:12px;color:var(--text-muted);display:block;margin-bottom:4px;">${i18n('API Key')}</label>
+						<input type="password" id="aiApiKey" value="${aiSettings.apiKey}" placeholder="sk-..." style="width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:6px;font-size:13px;">
+					</div>
+					<div style="margin-bottom:14px;">
+						<label style="font-size:12px;color:var(--text-muted);display:block;margin-bottom:4px;">${i18n('模型')}</label>
+						<input type="text" id="aiModel" value="${aiSettings.model}" placeholder="gpt-4o-mini" style="width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:6px;font-size:13px;">
+					</div>
+					<div style="display:flex;align-items:center;gap:8px;margin-bottom:14px;">
+						<input type="checkbox" id="aiEnabled" ${aiSettings.enabled ? 'checked' : ''}>
+						<label style="font-size:13px;cursor:pointer;" onclick="document.getElementById('aiEnabled').click()">${i18n('启用 AI 匹配')}</label>
+					</div>
+					<div style="border-top:1px solid var(--border);margin:4px 0 14px;padding-top:14px;">
+						<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">
+							<input type="checkbox" id="aiBatchSend" ${aiSettings.batchSend ? 'checked' : ''} onchange="document.getElementById('batchSizeRow').style.display=this.checked?'':'none'">
+							<label style="font-size:13px;cursor:pointer;" onclick="document.getElementById('aiBatchSend').click()">${i18n('组合发送（多个器件合并为一次请求）')}</label>
+						</div>
+						<div id="batchSizeRow" style="margin-bottom:10px;${aiSettings.batchSend ? '' : 'display:none;'}">
+							<label style="font-size:12px;color:var(--text-muted);display:block;margin-bottom:4px;">${i18n('模型最大上下文（K tokens）')}</label>
+							<input type="number" id="aiContextSize" value="${aiSettings.contextSize}" min="4" max="10000" placeholder="128" style="width:120px;padding:8px 10px;border:1px solid var(--border);border-radius:6px;font-size:13px;">
+						</div>
+					</div>
+					<div style="border-top:1px solid var(--border);margin:4px 0 14px;padding-top:14px;">
+						<h4 style="margin-bottom:10px;font-size:14px;">${i18n('绑定功能设置')}</h4>
+						<div style="display:flex;flex-direction:column;gap:8px;">
+							<label style="display:flex;align-items:center;gap:8px;padding:8px 12px;border:1px solid var(--border-light);border-radius:6px;cursor:pointer;">
+								<input type="checkbox" id="optKeepDesignatorId" ${bindOptions.keepDesignatorId ? 'checked' : ''}>
+								<div><div style="font-weight:500;font-size:13px;">${i18n('保留位号和唯一ID')}</div><div style="font-size:11px;color:var(--text-muted);margin-top:2px;">${i18n('绑定后保持原始器件的位号和唯一标识')}</div></div>
+							</label>
+							<label style="display:flex;align-items:center;gap:8px;padding:8px 12px;border:1px solid var(--border-light);border-radius:6px;cursor:pointer;">
+								<input type="checkbox" id="optKeepSymbol" ${bindOptions.keepSymbol ? 'checked' : ''}>
+								<div><div style="font-weight:500;font-size:13px;">${i18n('保留当前符号')}</div><div style="font-size:11px;color:var(--text-muted);margin-top:2px;">${i18n('绑定时不替换器件的原理图符号')}</div></div>
+							</label>
+							<label style="display:flex;align-items:center;gap:8px;padding:8px 12px;border:1px solid var(--border-light);border-radius:6px;cursor:pointer;">
+								<input type="checkbox" id="optKeepFootprint" ${bindOptions.keepFootprint ? 'checked' : ''}>
+								<div><div style="font-weight:500;font-size:13px;">${i18n('保留当前封装')}</div><div style="font-size:11px;color:var(--text-muted);margin-top:2px;">${i18n('绑定时不替换器件的PCB封装')}</div></div>
+							</label>
+						</div>
+					</div>
+					<div style="border-top:1px solid var(--border);margin:4px 0 14px;padding-top:14px;">
+						<h4 style="margin-bottom:10px;font-size:14px;">${i18n('绑定检测')}</h4>
+						<div style="margin-bottom:8px;">
+							<select id="bindDetectMode" style="width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:6px;font-size:13px;background:var(--bg);">
+								<option value="fp" ${bindDetectMode === 'fp' ? 'selected' : ''}>${i18n('检查 EasyEDA 封装')}</option>
+								<option value="lcsc" ${bindDetectMode === 'lcsc' ? 'selected' : ''}>${i18n('检查 LCSC 编号')}</option>
+								<option value="fp_or_lcsc" ${bindDetectMode === 'fp_or_lcsc' ? 'selected' : ''}>${i18n('检查封装或 LCSC')}</option>
+								<option value="any" ${bindDetectMode === 'any' ? 'selected' : ''}>${i18n('有器件即可')}</option>
+							</select>
+						</div>
+						<p style="font-size:11px;color:var(--text-muted);margin:0;">${i18n('选择判定器件为"已绑定"的条件')}</p>
+					</div>
+					<div style="border-top:1px solid var(--border);margin:4px 0 14px;padding-top:14px;">
+						<h4 style="margin-bottom:10px;font-size:14px;">${i18n('主题设置')}</h4>
+						<div style="margin-bottom:8px;">
+							<select id="themeSelect" style="width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:6px;font-size:13px;background:var(--bg);">
+								<option value="auto" ${themePreference === 'auto' ? 'selected' : ''}>${i18n('跟随系统')}</option>
+								<option value="light" ${themePreference === 'light' ? 'selected' : ''}>${i18n('浅色')}</option>
+								<option value="dark" ${themePreference === 'dark' ? 'selected' : ''}>${i18n('深色')}</option>
+							</select>
+						</div>
+					</div>
+					<div style="border-top:1px solid var(--border);margin:4px 0 14px;padding-top:14px;">
+						<h4 style="margin-bottom:10px;font-size:14px;">${i18n('降级匹配封装')}</h4>
+						<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">
+							<input type="checkbox" id="fallbackFootprint" ${fallbackFootprintEnabled ? 'checked' : ''} onchange="document.getElementById('fpColRow').style.display=this.checked?'':'none'">
+							<label style="font-size:13px;cursor:pointer;" onclick="document.getElementById('fallbackFootprint').click()">${i18n('匹配不到器件时，自动搜索封装库匹配封装')}</label>
+						</div>
+						<div id="fpColRow" style="margin-bottom:10px;${fallbackFootprintEnabled ? '' : 'display:none;'}">
+							<label style="font-size:12px;color:var(--text-muted);display:block;margin-bottom:4px;">${i18n('封装列（从 BOM 中选择封装对应的列）')}</label>
+							<select id="footprintColumnSelect" style="width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:6px;font-size:13px;background:var(--bg);">
+								<option value="">${i18n('-- 自动检测 --')}</option>
+								${bomColumns.map(col => `<option value="${col}" ${footprintColumn === col ? 'selected' : ''}>${col}</option>`).join('')}
+							</select>
+						</div>
+						<p style="font-size:11px;color:var(--text-muted);margin:0;">${i18n('开启后，标准匹配用封装列的值搜索封装库；AI 匹配会让 AI 推断封装名称后搜索。')}</p>
 					</div>
 				</div>
-				<div style="border-top:1px solid var(--border);margin:4px 0 14px;padding-top:14px;">
-					<h4 style="margin-bottom:10px;font-size:14px;">${i18n('绑定功能设置')}</h4>
-					<div style="display:flex;flex-direction:column;gap:6px;">${modeOptions}</div>
-				</div>
-				<div style="border-top:1px solid var(--border);margin:4px 0 14px;padding-top:14px;">
-					<h4 style="margin-bottom:10px;font-size:14px;">${i18n('降级匹配封装')}</h4>
-					<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">
-						<input type="checkbox" id="fallbackFootprint" ${fallbackFootprintEnabled ? 'checked' : ''} onchange="document.getElementById('fpColRow').style.display=this.checked?'':'none'">
-						<label style="font-size:13px;cursor:pointer;" onclick="document.getElementById('fallbackFootprint').click()">${i18n('匹配不到器件时，自动搜索封装库匹配封装')}</label>
-					</div>
-					<div id="fpColRow" style="margin-bottom:10px;${fallbackFootprintEnabled ? '' : 'display:none;'}">
-						<label style="font-size:12px;color:var(--text-muted);display:block;margin-bottom:4px;">${i18n('封装列（从 BOM 中选择封装对应的列）')}</label>
-						<select id="footprintColumnSelect" style="width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:6px;font-size:13px;background:var(--bg);">
-							<option value="">${i18n('-- 自动检测 --')}</option>
-							${bomColumns.map(col => `<option value="${col}" ${footprintColumn === col ? 'selected' : ''}>${col}</option>`).join('')}
-						</select>
-					</div>
-					<p style="font-size:11px;color:var(--text-muted);margin:0;">${i18n('开启后，标准匹配用封装列的值搜索封装库；AI 匹配会让 AI 推断封装名称后搜索。')}</p>
-				</div>
-				<div style="display:flex;gap:8px;justify-content:flex-end;">
+				<div class="modal-footer">
 					<button class="btn btn-outline btn-sm" onclick="this.closest('.modal-overlay').remove()">${i18n('取消')}</button>
 					<button class="btn btn-primary btn-sm" onclick="window.__app.saveAndCloseSettings()">${i18n('保存')}</button>
 				</div>
@@ -757,16 +1359,6 @@
 	}
 
 	/** 保存设置并关闭弹窗 */
-	/** 切换绑定模式选项的视觉高亮 */
-	function onBindModeChange(key) {
-		bindMode = key;
-		document.querySelectorAll('.bind-mode-item').forEach((el) => {
-			const isActive = el.dataset.key === key;
-			el.style.borderColor = isActive ? 'var(--primary)' : 'var(--border-light)';
-			el.style.background = isActive ? '#f0f7ff' : 'transparent';
-		});
-	}
-
 	async function saveAndCloseSettings() {
 		aiSettings.apiUrl = document.getElementById('aiApiUrl').value.trim();
 		aiSettings.apiKey = document.getElementById('aiApiKey').value.trim();
@@ -775,26 +1367,84 @@
 		aiSettings.batchSend = document.getElementById('aiBatchSend').checked;
 		const ctxVal = Number.parseInt(document.getElementById('aiContextSize')?.value || '128', 10);
 		aiSettings.contextSize = Number.isNaN(ctxVal) || ctxVal < 4 ? 128 : ctxVal;
-		// 读取绑定模式
-		const selectedMode = document.querySelector('input[name="bindMode"]:checked');
-		if (selectedMode) {
-			bindMode = selectedMode.value;
+		// 读取绑定选项
+		bindOptions.keepDesignatorId = document.getElementById('optKeepDesignatorId')?.checked ?? true;
+		bindOptions.keepSymbol = document.getElementById('optKeepSymbol')?.checked ?? true;
+		bindOptions.keepFootprint = document.getElementById('optKeepFootprint')?.checked ?? false;
+		bindDetectMode = document.getElementById('bindDetectMode')?.value || 'fp_or_lcsc';
+		aiSettings.bindOptions = { ...bindOptions };
+		aiSettings.bindDetectMode = bindDetectMode;
+		// 读取主题设置
+		const newTheme = document.getElementById('themeSelect')?.value || 'auto';
+		if (newTheme !== themePreference) {
+			themePreference = newTheme;
+			if (themePreference === 'auto') {
+				try { lastSystemTheme = await eda.sys_Window.getCurrentTheme(); } catch (e) {}
+			}
+			applyTheme();
+			try { await eda.sys_Storage.setExtensionUserConfig('themePreference', themePreference); } catch (e) {}
 		}
-		aiSettings.bindMode = bindMode;
 		// 读取降级匹配封装设置
 		fallbackFootprintEnabled = document.getElementById('fallbackFootprint')?.checked || false;
 		footprintColumn = document.getElementById('footprintColumnSelect')?.value || '';
 		aiSettings.fallbackFootprintEnabled = fallbackFootprintEnabled;
 		aiSettings.footprintColumn = footprintColumn;
-		console.warn(PLUGIN_TAG, 'Settings saved, bindMode:', bindMode, 'fallbackFp:', fallbackFootprintEnabled, 'fpCol:', footprintColumn);
+		console.warn(PLUGIN_TAG, 'Settings saved, bindOptions:', JSON.stringify(bindOptions), 'fallbackFp:', fallbackFootprintEnabled, 'fpCol:', footprintColumn);
 		await saveAISettings();
 		document.querySelector('.modal-overlay')?.remove();
-		// 更新匹配按钮显示状态
 		updateMatchButtonText();
-		showToast(aiSettings.enabled ? i18n('✅ AI 匹配已启用') : i18n('AI 匹配已禁用'), 'success');
+		// 重新检测绑定状态并刷新表格
+		if (bomData.length) {
+			await reDetectBindStatus();
+			renderTable(searchInput.value);
+		}
 	}
 
 	/** 更新匹配按钮文字（反映 AI 状态） */
+	/** 重新检测所有器件的绑定状态（根据 bindDetectMode） */
+	async function reDetectBindStatus() {
+		try {
+			const comps = await eda.sch_PrimitiveComponent.getAll('part', true);
+			if (!comps) return;
+			for (const comp of comps) {
+				const designator = comp.getState_Designator();
+				if (!designator) continue;
+				const ci = comp.getState_Component();
+				const fp = comp.getState_Footprint();
+				const other = comp.getState_OtherProperty();
+				const hasDevice = !!ci?.uuid;
+				const hasEasyedaFp = !!fp?.uuid;
+				const hasLcsc = !!(other?.LCSC || other?.['Supplier Part'] || other?.['立创编号']);
+				let isBound = false;
+				if (bindDetectMode === 'fp') isBound = hasDevice && hasEasyedaFp;
+				else if (bindDetectMode === 'lcsc') isBound = hasDevice && hasLcsc;
+				else if (bindDetectMode === 'fp_or_lcsc') isBound = hasDevice && (hasEasyedaFp || hasLcsc);
+				else isBound = hasDevice;
+
+				if (isBound) {
+					bindStatus[designator] = {
+						bound: true,
+						deviceInfo: {
+							name: ci?.name || '',
+							package: fp?.name || other?.['Origin Footprint'] || '',
+							lcsc: other?.LCSC || other?.['Supplier Part'] || '',
+							manufacturer: other?.Manufacturer || '',
+							libraryUuid: ci?.libraryUuid || '',
+							uuid: ci?.uuid || '',
+						},
+					};
+				}
+				else if (bindStatus[designator]?.bound) {
+					// 不再满足绑定条件，清除
+					delete bindStatus[designator];
+				}
+			}
+		}
+		catch (err) {
+			console.warn(PLUGIN_TAG, 'reDetectBindStatus failed:', err);
+		}
+	}
+
 	function updateMatchButtonText() {
 		const btn = document.getElementById('btnMatch');
 		if (btn) {
@@ -1344,7 +1994,7 @@
 	}
 
 	async function bindComponent(primitiveId, deviceInfo) {
-		console.warn(PLUGIN_TAG, 'bindComponent called, bindMode:', bindMode);
+		console.warn(PLUGIN_TAG, 'bindComponent called, options:', JSON.stringify(bindOptions));
 		if (!primitiveId) {
 			console.warn(PLUGIN_TAG, 'No primitiveId, cannot bind');
 			return false;
@@ -1359,7 +2009,6 @@
 
 			const compInfo = comp.getState_Component();
 			const fpInfo = comp.getState_Footprint();
-			console.warn(PLUGIN_TAG, 'compInfo:', compInfo.uuid, compInfo.name, 'lib:', compInfo.libraryUuid, 'fp:', fpInfo?.uuid);
 			const saved = {
 				designator: comp.getState_Designator(),
 				name: comp.getState_Name(),
@@ -1380,164 +2029,96 @@
 				originalFootprint: fpInfo ? { uuid: fpInfo.uuid, libraryUuid: fpInfo.libraryUuid } : null,
 			};
 
-			// === 模式: 只绑定封装 ===
-			if (bindMode === 'footprint') {
-				if (!deviceInfo.package && !deviceInfo.name) {
-					showToast(i18n('无封装信息可绑定'), 'error');
-					return false;
+			const keepSymbol = bindOptions.keepSymbol;
+			const keepFootprint = bindOptions.keepFootprint;
+
+			// 合并 otherProperty（元数据总是更新）
+			const mergedOther = { ...(saved.otherProperty || {}) };
+			if (deviceInfo.name) mergedOther['LCSC Part Name'] = deviceInfo.name;
+			if (deviceInfo.mpn) mergedOther['Manufacturer Part'] = deviceInfo.mpn;
+			if (deviceInfo.manufacturer) mergedOther.Manufacturer = deviceInfo.manufacturer;
+			if (deviceInfo.lcsc) mergedOther['Supplier Part'] = deviceInfo.lcsc;
+			if (deviceInfo.package) mergedOther['Supplier Footprint'] = deviceInfo.package;
+			if (deviceInfo.description) mergedOther.Description = deviceInfo.description;
+
+			const modifyParams = {
+				manufacturer: deviceInfo.manufacturer || saved.manufacturer || null,
+				manufacturerId: deviceInfo.mpn || saved.manufacturerId || null,
+				supplier: deviceInfo.supplier || saved.supplier || null,
+				supplierId: deviceInfo.lcsc || saved.supplierId || null,
+				otherProperty: mergedOther,
+			};
+			if (bindOptions.keepDesignatorId) {
+				modifyParams.designator = saved.designator;
+				modifyParams.name = saved.name;
+				modifyParams.uniqueId = saved.uniqueId;
+			}
+
+			// 场景 A：符号和封装都保留 → 仅更新元数据，不重建器件
+			if (keepSymbol && keepFootprint) {
+				await eda.sch_PrimitiveComponent.modify(primitiveId, modifyParams);
+				return { saved, newPrimitiveId: primitiveId };
+			}
+
+			// 场景 B/C/D：需要换符号或封装 —— 通过修改当前 device 的关联再重建来刷新
+			// sch_PrimitiveComponent.modify() 无法替换 symbol/footprint 引用，只能改显示字段
+			let targetFootprint = null;
+			if (!keepFootprint) {
+				if (deviceInfo.footprintUuid && deviceInfo.libraryUuid) {
+					targetFootprint = { uuid: deviceInfo.footprintUuid, libraryUuid: deviceInfo.libraryUuid };
 				}
-				// 1. 搜索目标封装
-				const fpSearch = await eda.lib_Footprint.search(deviceInfo.package || deviceInfo.name);
-				const targetFp = fpSearch[0];
-				if (!targetFp) {
+				else if (deviceInfo.package || deviceInfo.name) {
+					try {
+						const fpSearch = await eda.lib_Footprint.search(deviceInfo.package || deviceInfo.name);
+						if (fpSearch[0])
+							targetFootprint = { uuid: fpSearch[0].uuid, libraryUuid: fpSearch[0].libraryUuid };
+					}
+					catch (e) {
+						console.error(PLUGIN_TAG, 'lib_Footprint.search failed', e);
+					}
+				}
+				if (!targetFootprint) {
 					showToast(i18n('未找到目标封装'), 'error');
 					return false;
 				}
-				// 2. 解析器件真实所属库（导入器件 libraryUuid 常为空，需搜索确认）
-				const deviceLib = await resolveDeviceLibrary(compInfo);
-				// 3. 修改器件封装（在器件真实所属库中修改，符号保持不变）
-				console.warn(PLUGIN_TAG, '[footprint] modify device:', compInfo.uuid, 'lib:', deviceLib, '→ fp:', targetFp.uuid);
-				const modifyOk = await eda.lib_Device.modify(compInfo.uuid, deviceLib, undefined, undefined, {
-					footprint: { uuid: targetFp.uuid, libraryUuid: targetFp.libraryUuid },
-				});
-				console.warn(PLUGIN_TAG, '[footprint] modify result:', modifyOk);
-				// 4. 删除旧器件
-				await eda.sch_PrimitiveComponent.delete(primitiveId);
-				// 5. 用同一器件重建（沿用真实库 UUID），器件本身不替换，仅更新封装
-				console.warn(PLUGIN_TAG, '[footprint] create with lib:', deviceLib, compInfo.uuid);
-				const newComp = await eda.sch_PrimitiveComponent.create(
-					{ libraryUuid: deviceLib, uuid: compInfo.uuid },
-					saved.x,
-					saved.y,
-					'',
-					saved.rotation,
-					saved.mirror,
-				);
-				if (!newComp)
-					return false;
-				await eda.sch_PrimitiveComponent.modify(newComp.primitiveId, {
-					designator: saved.designator,
-					name: saved.name,
-					uniqueId: saved.uniqueId,
-					addIntoBom: saved.addIntoBom,
-					addIntoPcb: saved.addIntoPcb,
-					manufacturer: saved.manufacturer,
-					manufacturerId: saved.manufacturerId,
-					supplier: saved.supplier,
-					supplierId: saved.supplierId,
-					otherProperty: saved.otherProperty,
-				});
-				return { saved, newPrimitiveId: newComp.primitiveId };
 			}
 
-			// === 模式: 只绑定符号 ===
-			if (bindMode === 'symbol') {
-				if (!deviceInfo.name && !deviceInfo.mpn) {
-					showToast(i18n('无器件信息可绑定符号'), 'error');
-					return false;
+			let targetSymbol = null;
+			if (!keepSymbol) {
+				if (deviceInfo.symbolUuid && deviceInfo.libraryUuid) {
+					targetSymbol = { uuid: deviceInfo.symbolUuid, libraryUuid: deviceInfo.libraryUuid };
 				}
-				const symSearch = await eda.lib_Symbol.search(deviceInfo.name || deviceInfo.mpn);
-				const targetSym = symSearch[0];
-				if (!targetSym) {
+				else {
 					showToast(i18n('未找到目标符号'), 'error');
 					return false;
 				}
-				// 解析器件真实所属库（导入器件 libraryUuid 常为空，需搜索确认）
-				const deviceLib = await resolveDeviceLibrary(compInfo);
-				// 修改器件符号（在器件真实所属库中修改）
-				console.warn(PLUGIN_TAG, '[symbol] modify device:', compInfo.uuid, 'lib:', deviceLib, '→ sym:', targetSym.uuid);
-				const modifyOkSym = await eda.lib_Device.modify(compInfo.uuid, deviceLib, undefined, undefined, {
-					symbol: { uuid: targetSym.uuid, libraryUuid: targetSym.libraryUuid },
-				});
-				console.warn(PLUGIN_TAG, '[symbol] modify result:', modifyOkSym);
-				await eda.sch_PrimitiveComponent.delete(primitiveId);
-				console.warn(PLUGIN_TAG, '[symbol] create with lib:', deviceLib, compInfo.uuid);
-				const newCompSym = await eda.sch_PrimitiveComponent.create(
-					{ libraryUuid: deviceLib, uuid: compInfo.uuid },
-					saved.x,
-					saved.y,
-					'',
-					saved.rotation,
-					saved.mirror,
-				);
-				if (!newCompSym)
-					return false;
-				await eda.sch_PrimitiveComponent.modify(newCompSym.primitiveId, {
-					designator: saved.designator,
-					name: saved.name,
-					uniqueId: saved.uniqueId,
-					addIntoBom: saved.addIntoBom,
-					addIntoPcb: saved.addIntoPcb,
-					manufacturer: saved.manufacturer,
-					manufacturerId: saved.manufacturerId,
-					supplier: saved.supplier,
-					supplierId: saved.supplierId,
-					otherProperty: saved.otherProperty,
-				});
-				return { saved, newPrimitiveId: newCompSym.primitiveId };
 			}
 
-			// === 模式: 替换器件（用目标器件直接替换） ===
-			if (bindMode === 'replace') {
-				if (!deviceInfo.uuid || !deviceInfo.libraryUuid) {
-					showToast(i18n('目标器件信息不完整'), 'error');
-					return false;
-				}
-				console.warn(PLUGIN_TAG, '[replace] delete old, create with:', deviceInfo.libraryUuid, deviceInfo.uuid);
-				await eda.sch_PrimitiveComponent.delete(primitiveId);
-				const newCompReplace = await eda.sch_PrimitiveComponent.create(
-					{ libraryUuid: deviceInfo.libraryUuid, uuid: deviceInfo.uuid },
-					saved.x,
-					saved.y,
-					'',
-					saved.rotation,
-					saved.mirror,
-				);
-				if (!newCompReplace)
-					return false;
-				await eda.sch_PrimitiveComponent.modify(newCompReplace.primitiveId, {
-					designator: saved.designator,
-					name: saved.name,
-					uniqueId: saved.uniqueId,
-					addIntoBom: saved.addIntoBom,
-					addIntoPcb: saved.addIntoPcb,
-					manufacturer: saved.manufacturer,
-					manufacturerId: saved.manufacturerId,
-					supplier: saved.supplier,
-					supplierId: saved.supplierId,
-					otherProperty: saved.otherProperty,
-				});
-				return true;
+			const association = {};
+			if (targetFootprint) association.footprint = targetFootprint;
+			if (targetSymbol) association.symbol = targetSymbol;
+
+			const realLib = await resolveDeviceLibrary(compInfo);
+			const modOk = await eda.lib_Device.modify(compInfo.uuid, realLib, undefined, undefined, association);
+			if (!modOk) {
+				showToast(i18n('修改器件封装/符号失败'), 'error');
+				return false;
 			}
 
-			// === 模式: 替换数据（modify，不删除重建，保留旋转等） ===
-			if (bindMode === 'data') {
-				const mergedOther = { ...(saved.otherProperty || {}) };
-				if (deviceInfo.name)
-					mergedOther['LCSC Part Name'] = deviceInfo.name;
-				if (deviceInfo.mpn)
-					mergedOther['Manufacturer Part'] = deviceInfo.mpn;
-				if (deviceInfo.manufacturer)
-					mergedOther.Manufacturer = deviceInfo.manufacturer;
-				if (deviceInfo.lcsc)
-					mergedOther['Supplier Part'] = deviceInfo.lcsc;
-				if (deviceInfo.package)
-					mergedOther['Supplier Footprint'] = deviceInfo.package;
-				if (deviceInfo.description)
-					mergedOther.Description = deviceInfo.description;
-				await eda.sch_PrimitiveComponent.modify(primitiveId, {
-					name: deviceInfo.name || null,
-					manufacturer: deviceInfo.manufacturer || null,
-					manufacturerId: deviceInfo.mpn || null,
-					supplier: deviceInfo.supplier || null,
-					supplierId: deviceInfo.lcsc || null,
-					otherProperty: mergedOther,
-				});
-				return true;
+			// 用同一 device uuid 重建 → 未修改的一侧（符号或封装）保持不变
+			await eda.sch_PrimitiveComponent.delete(primitiveId);
+			const created = await eda.sch_PrimitiveComponent.create(
+				{ libraryUuid: realLib, uuid: compInfo.uuid },
+				saved.x, saved.y, '', saved.rotation, saved.mirror,
+				saved.addIntoBom, saved.addIntoPcb,
+			);
+			if (!created) {
+				showToast(i18n('重建器件失败'), 'error');
+				return false;
 			}
 
-			// 所有模式都已处理，不应到达这里
-			return false;
+			await eda.sch_PrimitiveComponent.modify(created.primitiveId, modifyParams);
+			return { saved, newPrimitiveId: created.primitiveId };
 		}
 		catch (err) {
 			console.error(PLUGIN_TAG, 'Bind component failed', err);
@@ -1565,8 +2146,35 @@
 	 * 计算单个器件的匹配度
 	 * 基于选定的多选匹配列计算分数
 	 */
+	/** BOM 列名 → 器件字段映射 */
+	function bomColToDeviceField(col, device) {
+		const c = col.toLowerCase();
+		// 型号/名称/MPN
+		if (['mpn', '型号', 'name', 'value', '元件名称', 'comment', 'part number', 'marking code', 'manufacturer part', 'manufacturer part number', 'mfr part', 'mfr part number'].some(k => c.includes(k) || c === k)) {
+			return String(device.name || '').trim().toLowerCase();
+		}
+		// 封装
+		if (['footprint', '封装', 'package', 'pcb decal'].some(k => c.includes(k) || c === k)) {
+			return String(device.package || '').trim().toLowerCase();
+		}
+		// LCSC / 立创编号 / 供应商编号
+		if (['lcsc', '立创编号', '供应商编号', 'supplier part', 'supplier'].some(k => c.includes(k) || c === k)) {
+			return String(device.lcsc || '').trim().toLowerCase();
+		}
+		// 制造商
+		if (['manufacturer', '制造商', 'brand', 'mfr'].some(k => c.includes(k) || c === k) && !c.includes('part')) {
+			return String(device.manufacturer || '').trim().toLowerCase();
+		}
+		// 描述
+		if (['description', '描述', '说明', 'desc', 'details', 'remark'].some(k => c.includes(k) || c === k)) {
+			return String(device.description || '').trim().toLowerCase();
+		}
+		// 默认：尝试匹配 name
+		return String(device.name || '').trim().toLowerCase();
+	}
+
 	function calcMatchScore(g, device) {
-		// 有选中列时，按选中列计算
+		// 有选中列时，按选中列计算（只比对勾选列对应的器件字段）
 		if (matchColumns.length) {
 			let matchedCols = 0;
 			let totalCols = 0;
@@ -1575,16 +2183,14 @@
 				if (!bomVal)
 					continue;
 				totalCols++;
-				const devName = String(device.name || '').trim().toLowerCase();
-				const devPkg = String(device.package || '').trim().toLowerCase();
-				const devDesc = String(device.description || '').trim().toLowerCase();
+				const devVal = bomColToDeviceField(col, device);
+				if (!devVal)
+					continue;
 				// 完全匹配得 1 分，包含匹配得 0.5 分
-				if (devName === bomVal || devPkg === bomVal || devDesc === bomVal) {
+				if (devVal === bomVal) {
 					matchedCols += 1;
 				}
-				else if (devName.includes(bomVal) || bomVal.includes(devName)
-					|| devPkg.includes(bomVal) || bomVal.includes(devPkg)
-					|| devDesc.includes(bomVal) || bomVal.includes(devDesc)) {
+				else if (devVal.includes(bomVal) || bomVal.includes(devVal)) {
 					matchedCols += 0.5;
 				}
 			}
@@ -1905,6 +2511,9 @@
 		const showPending = document.getElementById('filterPending')?.checked ?? true;
 		const showUnmatched = document.getElementById('filterUnmatched')?.checked ?? true;
 
+		// 动态渲染表头
+		renderTableHead();
+
 		const filtered = bomData.filter((g) => {
 			// 文本过滤（位号、型号、封装、值）
 			if (f) {
@@ -1927,13 +2536,18 @@
 			return true;
 		});
 
-		if (!filtered.length) {
+		// 排序
+		const sorted = sortData(filtered);
+
+		if (!sorted.length) {
 			tableBody.innerHTML = '';
 			show(emptyState);
 			return;
 		}
 
-		tableBody.innerHTML = filtered
+		const visibleCols = tableColumns.filter(c => c.visible);
+
+		tableBody.innerHTML = sorted
 			.map((g) => {
 				const k = g.designatorList.join(',');
 				const mr = matchResults[k] || {};
@@ -1943,37 +2557,68 @@
 				const anySelected = g.designatorList.some(d => selectedDesignators.has(d));
 				const expanded = expandedDesignatorSets.has(k);
 
-				let dd = g.designatorStr;
-				if (g.designatorList.length > 3 && !expanded) {
-					dd = `${g.designatorList.slice(0, 3).join(', ')} ... <span class="designator-toggle" onclick="window.__app.toggleDesignatorExpand('${k}');event.stopPropagation();">(${i18n('共${1}个', g.designatorList.length)})</span>`;
+				// 按可见列生成单元格
+				let cells = '';
+				for (const col of visibleCols) {
+					if (col.key === 'checkbox') {
+						cells += `<td onclick="event.stopPropagation();window.__app.toggleGroupSelect('${k}')"><span class="checkbox-custom ${anySelected ? 'checked' : ''}"></span></td>`;
+					}
+					else if (col.key === 'designator') {
+						let dd = g.designatorStr;
+						if (g.designatorList.length > 3 && !expanded) {
+							dd = `${g.designatorList.slice(0, 3).join(', ')} ... <span class="designator-toggle" onclick="window.__app.toggleDesignatorExpand('${k}');event.stopPropagation();">(${i18n('共${1}个', g.designatorList.length)})</span>`;
+						}
+						cells += `<td class="cell-designator">${dd}</td>`;
+					}
+					else if (col.key === 'mpn') {
+						cells += `<td>${g.mpn || '-'}</td>`;
+					}
+					else if (col.key === 'qty') {
+						cells += `<td style="text-align:center;">${g.qty}</td>`;
+					}
+					else if (col.key === 'footprint') {
+						cells += `<td>${g.pkg || '-'}</td>`;
+					}
+					else if (col.key === 'matchResult') {
+						let mb = `<span class="badge badge-neutral">${i18n('未匹配')}</span>`;
+						if (best && mr.footprintOnly)
+							mb = `<span class="badge badge-info">📦 ${best.name}</span>`;
+						else if (best && score >= 95)
+							mb = `<span class="badge badge-success">✅ ${best.name} (${best.package || '-'})</span>`;
+						else if (best && score >= 60)
+							mb = `<span class="badge badge-warning">⚠️ ${best.name} (${best.package || '-'})</span>`;
+						else if (best)
+							mb = `<span class="badge badge-neutral">${best.name} (${best.package || '-'})</span>`;
+						cells += `<td>${mb}</td>`;
+					}
+					else if (col.key === 'matchScore') {
+						cells += `<td style="font-weight:700;">${score}%${mr?.aiRecommended ? ' <span class="badge badge-success">🤖 AI</span>' : ''}</td>`;
+					}
+					else if (col.key === 'bindStatus') {
+						cells += `<td>${allBound ? `<span class="badge badge-success">${i18n('已绑定')}</span>` : `<span class="badge badge-neutral">${i18n('未绑定')}</span>`}</td>`;
+					}
+					else if (col.key.startsWith('custom_')) {
+						// 自定义 BOM 数据列：从 _raw 中读取
+						const rawKey = col.key.slice(7); // 去掉 'custom_' 前缀
+						const val = g._raw?.[rawKey] || g[rawKey] || '-';
+						cells += `<td title="${val}">${val}</td>`;
+					}
+					else if (col.key === 'actions') {
+						cells += `<td onclick="event.stopPropagation();">`;
+						if (best) {
+							// 已匹配：详情 + 解绑
+							cells += `<button class="btn btn-outline btn-xs" onclick="window.__app.viewDetail('${k}')">${i18n('详情')}</button>`;
+							cells += `<button class="btn btn-outline btn-xs" onclick="window.__app.unbindGroup('${k}')">${i18n('解绑')}</button>`;
+						}
+						else {
+							// 未匹配：手动
+							cells += `<button class="btn btn-outline btn-xs" onclick="window.__app.manualMatch('${k}')">${i18n('手动')}</button>`;
+						}
+						cells += `</td>`;
+					}
 				}
 
-				let mb = `<span class="badge badge-neutral">${i18n('未匹配')}</span>`;
-				if (best && mr.footprintOnly)
-					mb = `<span class="badge badge-info">📦 ${best.name}</span>`;
-				else if (best && score >= 95)
-					mb = `<span class="badge badge-success">✅ ${best.name} (${best.package || '-'})</span>`;
-				else if (best && score >= 60)
-					mb = `<span class="badge badge-warning">⚠️ ${best.name} (${best.package || '-'})</span>`;
-				else if (best)
-					mb = `<span class="badge badge-neutral">${best.name} (${best.package || '-'})</span>`;
-
-				return `<tr class="${anySelected ? 'selected' : ''}" data-key="${k}" onclick="window.__app.onGroupClick(event,'${k}')">
-					<td onclick="event.stopPropagation();window.__app.toggleGroupSelect('${k}')"><span class="checkbox-custom ${anySelected ? 'checked' : ''}"></span></td>
-					<td class="cell-designator">${dd}</td>
-					<td>${g.mpn || '-'}</td>
-					<td style="text-align:center;">${g.qty}</td>
-					<td>${g.pkg || '-'}</td>
-					<td>${mb}</td>
-					<td style="font-weight:700;">${score}%${mr?.aiRecommended ? ' <span class="badge badge-success">🤖 AI</span>' : ''}</td>
-					<td>${allBound ? `<span class="badge badge-success">${i18n('已绑定')}</span>` : `<span class="badge badge-neutral">${i18n('未绑定')}</span>`}</td>
-					<td onclick="event.stopPropagation();">
-						<button class="btn btn-outline btn-xs" onclick="window.__app.viewDetail('${k}')">${i18n('详情')}</button>
-						${!allBound && best ? `<button class="btn btn-success btn-xs" onclick="window.__app.bindGroup('${k}')">${mr.footprintOnly ? i18n('📦 绑定封装') : i18n('绑定')}</button>` : ''}
-						${!best ? `<button class="btn btn-outline btn-xs" onclick="window.__app.manualMatch('${k}')">${i18n('手动')}</button>` : ''}
-						${allBound ? `<button class="btn btn-outline btn-xs" onclick="window.__app.unbindGroup('${k}')">${i18n('解绑')}</button>` : ''}
-					</td>
-				</tr>`;
+				return `<tr class="${anySelected ? 'selected' : ''}" data-key="${k}" onclick="window.__app.onGroupClick(event,'${k}')">${cells}</tr>`;
 			})
 			.join('');
 
@@ -2037,34 +2682,34 @@
 	 * 打开匹配依据列弹窗（复选框）
 	 */
 	function openMatchColumnsModal() {
-		let html = `<div class="modal-overlay" id="matchColsOverlay" onclick="if(event.target===this)this.remove()">
-			<div class="modal" style="width:400px;">
-				<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
-					<h3>${i18n('选择匹配依据列')}</h3>
-					<button class="btn-icon" onclick="this.closest('.modal-overlay').remove()">✕</button>
-				</div>
-				<p style="font-size:12px;color:var(--text-muted);margin-bottom:12px;">${i18n('勾选的列将作为搜索关键词组合')}</p>
-				<div style="max-height:400px;overflow-y:auto;">`;
+		let bodyHtml = `<p style="font-size:12px;color:var(--text-muted);margin-bottom:12px;">${i18n('勾选的列将作为搜索关键词组合')}</p>`;
 
 		for (const col of bomColumns) {
 			const checked = matchColumns.includes(col) ? 'checked' : '';
-			html += `<label style="display:flex;align-items:center;gap:8px;padding:8px 12px;margin:4px 0;border:1px solid var(--border-light);border-radius:6px;cursor:pointer;">
+			bodyHtml += `<label style="display:flex;align-items:center;gap:8px;padding:8px 12px;margin:4px 0;border:1px solid var(--border-light);border-radius:6px;cursor:pointer;">
 				<input type="checkbox" value="${col}" ${checked} onchange="window.__app.onMatchColChange()">
 				<span>${col}</span>
 			</label>`;
 		}
 
-		html += `</div>
-				<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px;">
+		modalContainer.innerHTML = `<div class="modal-overlay" id="matchColsOverlay">
+			<div class="modal" style="width:400px;">
+				<div class="modal-header">
+					<h3>${i18n('选择匹配依据列')}</h3>
+					<button class="btn-icon" onclick="this.closest('.modal-overlay').remove()">✕</button>
+				</div>
+				<div class="modal-body">
+					${bodyHtml}
+				</div>
+				<div class="modal-footer">
 					<button class="btn btn-outline btn-sm" onclick="window.__app.clearMatchColumns()">${i18n('清空')}</button>
 					<button class="btn btn-primary btn-sm" onclick="document.getElementById('matchColsOverlay').remove()">${i18n('确定')}</button>
 				</div>
 			</div>
 		</div>`;
-
-		modalContainer.innerHTML = html;
 	}
 
+	/** 保存匹配依据列设置 */
 	/** 匹配依据列复选框变化 */
 	function onMatchColChange() {
 		const checkboxes = document.querySelectorAll('#matchColsOverlay input[type="checkbox"]:checked');
@@ -2118,9 +2763,11 @@
 		hide(panelEmpty);
 		show(panelContent);
 
-		let h = `<div style="display:flex;justify-content:space-between;margin-bottom:16px;">
-			<b>📋 ${g.designatorStr}</b>
-			<button onclick="window.__app.closeDetail()" class="btn-icon">✕</button>
+		let h = `<div class="panel-header-fixed">
+			<div style="display:flex;justify-content:space-between;align-items:center;">
+				<b>📋 ${g.designatorStr}</b>
+				<button onclick="window.__app.closeDetail()" class="btn-icon">✕</button>
+			</div>
 		</div>`;
 
 		// 只显示封装列和匹配依据列
@@ -2138,53 +2785,61 @@
 			}
 		}
 
-		const dd = boundDevice || best;
-		if (dd) {
+		// 图片样式
+		const imgStyle = 'max-width:100%;max-height:100%;object-fit:contain;cursor:pointer;border-radius:4px;';
+		const cellStyle = 'flex:1;text-align:center;min-width:0;';
+		const imgBoxStyle = 'height:80px;display:flex;align-items:center;justify-content:center;background:var(--surface-alt);border-radius:6px;padding:4px;cursor:pointer;transition:border-color 0.2s;border:1px solid var(--border-light);';
+
+		// 当前绑定器件（始终展示封装和符号）
+		if (boundDevice) {
+			h += `<div style="margin-top:16px;"><b>${i18n('当前绑定器件')}</b></div>`;
+			h += `<div style="display:flex;gap:8px;margin:8px 0;">`;
+			h += `<div style="${cellStyle}"><div style="font-size:11px;color:var(--text-muted);margin-bottom:4px;">${i18n('封装')}</div><div id="fpRenderBound" style="${imgBoxStyle}" onclick="window.__app.previewRender('fpBound')">${genPkgSVG(boundDevice.package || '', 80, 50)}</div></div>`;
+			h += `<div style="${cellStyle}"><div style="font-size:11px;color:var(--text-muted);margin-bottom:4px;">${i18n('符号')}</div><div id="symRenderBound" style="${imgBoxStyle}" onclick="window.__app.previewRender('symBound')">${genSymSVG(boundDevice.name || '', 70, 50)}</div></div>`;
+			h += `</div>`;
+			h += `<div style="display:flex;justify-content:space-between;padding:3px 0;"><span style="color:var(--text-muted);">${i18n('型号')}</span><span>${boundDevice.name || '-'}</span></div>`;
+			h += `<div style="display:flex;justify-content:space-between;padding:3px 0;"><span style="color:var(--text-muted);">${i18n('封装')}</span><span>${boundDevice.package || '-'}</span></div>`;
+			h += `<div style="display:flex;justify-content:space-between;padding:3px 0;"><span style="color:var(--text-muted);">LCSC</span><span>${boundDevice.lcsc || '-'}</span></div>`;
+		}
+
+		// 最佳匹配器件
+		if (best) {
 			const aiTag = mr?.aiRecommended ? i18n(' 🤖 AI推荐') : '';
-			h += `<div style="margin-top:16px;"><b>${boundDevice ? i18n('当前绑定器件') : i18n('最佳匹配器件')}${aiTag}</b></div>`;
-			// AI 推荐原因
+			h += `<div style="margin-top:16px;"><b>${i18n('最佳匹配器件')}${aiTag}</b></div>`;
 			if (mr?.aiReason) {
-				h += `<div style="padding:10px 12px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;margin:8px 0;font-size:12px;color:#166534;">
+				h += `<div style="padding:10px 12px;background:var(--bg-success);border:1px solid var(--bg-success-border);border-radius:8px;margin:8px 0;font-size:12px;color:var(--text-success);">
 					<b>${i18n('🤖 AI 分析：')}</b>${mr.aiReason}
 				</div>`;
 			}
-			// 产品图片（LCSC 实物图）
-			if (dd.imageUrl) {
-				h += `<div style="text-align:center;padding:12px;background:#f8fafc;border-radius:8px;margin:8px 0;">
-					<img src="${dd.imageUrl}" alt="${dd.name || ''}" style="max-width:200px;max-height:160px;object-fit:contain;border-radius:4px;" onerror="this.style.display='none'">
-				</div>`;
+			h += `<div style="display:flex;gap:8px;margin:8px 0;">`;
+			if (best.imageUrl) {
+				h += `<div style="${cellStyle}"><div style="font-size:11px;color:var(--text-muted);margin-bottom:4px;">${i18n('产品图')}</div><div style="${imgBoxStyle}" onclick="window.__app.previewImage('${best.imageUrl}','${i18n('产品图')}')"><img src="${best.imageUrl}" style="${imgStyle}" onerror="this.parentElement.innerHTML='<span style=\\'color:var(--text-muted);font-size:11px\\'>${i18n('无图片')}</span>'"></div></div>`;
 			}
-			// 封装/符号渲染图占位（异步加载）
-			h += `<div id="renderImages" style="display:flex;gap:16px;justify-content:center;padding:8px;background:#f8fafc;border-radius:8px;margin:8px 0;">
-				<div style="text-align:center;"><div style="font-size:11px;color:var(--text-muted);margin-bottom:4px;">${i18n('封装')}</div><div id="fpRender">${genPkgSVG(dd.package || dd.pkg, 80, 50)}</div></div>
-				<div style="text-align:center;"><div style="font-size:11px;color:var(--text-muted);margin-bottom:4px;">${i18n('符号')}</div><div id="symRender">${genSymSVG(dd.name || dd.mpn, 70, 50)}</div></div>
-			</div>`;
-			// 获取 BOM 原始 Value（从匹配依据列或自动检测）
+			h += `<div style="${cellStyle}"><div style="font-size:11px;color:var(--text-muted);margin-bottom:4px;">${i18n('封装')}</div><div id="fpRender" style="${imgBoxStyle}" onclick="window.__app.previewRender('fp')">${genPkgSVG(best.package || best.pkg || '', 80, 50)}</div></div>`;
+			h += `<div style="${cellStyle}"><div style="font-size:11px;color:var(--text-muted);margin-bottom:4px;">${i18n('符号')}</div><div id="symRender" style="${imgBoxStyle}" onclick="window.__app.previewRender('sym')">${genSymSVG(best.name || best.mpn || '', 70, 50)}</div></div>`;
+			h += `</div>`;
 			const valKeywords = ['value', 'name', i18n('元件名称'), 'marking code', i18n('型号'), 'comment'];
 			let bomValue = '';
 			for (const col of matchColumns) {
 				if (valKeywords.some(k => col.toLowerCase().includes(k))) {
 					bomValue = String(g._raw[col] || '');
-					if (bomValue)
-						break;
+					if (bomValue) break;
 				}
 			}
-			if (!bomValue)
-				bomValue = g.value || '';
+			if (!bomValue) bomValue = g.value || '';
 			const fields = [
 				['Value', bomValue || '-'],
-				[i18n('型号'), dd.name || dd.mpn],
-				[i18n('封装'), dd.package || dd.pkg],
-				[i18n('制造商'), dd.manufacturer || '-'],
-				['LCSC', dd.lcsc || '-'],
-				[i18n('描述'), dd.description || '-'],
+				[i18n('型号'), best.name || best.mpn],
+				[i18n('封装'), best.package || best.pkg],
+				[i18n('制造商'), best.manufacturer || '-'],
+				['LCSC', best.lcsc || '-'],
+				[i18n('描述'), best.description || '-'],
 			];
-			h += fields
-				.map(([key, val]) => `<div style="display:flex;justify-content:space-between;padding:3px 0;"><span style="color:var(--text-muted);">${key}</span><span>${val || '-'}</span></div>`)
-				.join('');
+			h += fields.map(([key, val]) => `<div style="display:flex;justify-content:space-between;padding:3px 0;"><span style="color:var(--text-muted);">${key}</span><span>${val || '-'}</span></div>`).join('');
 			h += `<button class="btn btn-success" style="width:100%;margin-top:12px;" onclick="window.__app.bindGroup('${k}')">${i18n('绑定该器件')}</button>`;
 		}
-		else {
+
+		if (!boundDevice && !best) {
 			h += `<div style="text-align:center;padding:20px;color:var(--text-muted);">${i18n('暂无匹配器件')}</div>`;
 		}
 
@@ -2245,6 +2900,88 @@
 		show(panelEmpty);
 	}
 
+	/** 点击放大预览图片 */
+	function previewImage(url, title) {
+		if (!url) return;
+		openPreviewModal(`<img src="${url}" style="max-width:100%;max-height:100%;object-fit:contain;" onerror="this.parentElement.innerHTML='<span style=\\'color:var(--text-muted)\\'>${i18n('无图片')}</span>'">`, title || i18n('产品图'));
+	}
+
+	function previewRender(type) {
+		const idMap = { fp: 'fpRender', sym: 'symRender', fpBound: 'fpRenderBound', symBound: 'symRenderBound' };
+		const container = document.getElementById(idMap[type]);
+		if (!container) return;
+		const svg = container.querySelector('svg');
+		if (!svg) {
+			// 没有 SVG，尝试用整个内容预览
+			if (container.innerHTML.trim()) {
+				openPreviewModal(container.innerHTML, type === 'fp' ? i18n('封装') : i18n('符号'));
+			}
+			return;
+		}
+		const svgClone = svg.cloneNode(true);
+		// 放大尺寸
+		const origW = parseFloat(svg.getAttribute('width')) || 80;
+		const origH = parseFloat(svg.getAttribute('height')) || 50;
+		const scale = 4;
+		svgClone.setAttribute('width', origW * scale);
+		svgClone.setAttribute('height', origH * scale);
+		svgClone.style.width = (origW * scale) + 'px';
+		svgClone.style.height = (origH * scale) + 'px';
+		const title = type === 'fp' ? i18n('封装') : i18n('符号');
+		openPreviewModal(svgClone.outerHTML, title);
+	}
+
+	/** 统一预览弹窗（支持滚轮缩放 + 拖拽平移） */
+	function openPreviewModal(innerHtml, title) {
+		modalContainer.innerHTML = `<div class="preview-overlay" id="previewOverlay">
+			<div class="preview-toolbar">
+				<span class="preview-title">${title}</span>
+				<span class="preview-hint">${i18n('滚轮缩放 · 拖拽平移')}</span>
+				<button class="btn-icon" style="color:#fff;font-size:18px;" onclick="document.getElementById('previewOverlay').remove()">✕</button>
+			</div>
+			<div class="preview-viewport" id="previewViewport">
+				<div class="preview-content" id="previewContent">${innerHtml}</div>
+			</div>
+		</div>`;
+		initPreviewInteraction();
+	}
+
+	/** 初始化预览交互（滚轮缩放，以鼠标位置为中心） */
+	function initPreviewInteraction() {
+		const viewport = document.getElementById('previewViewport');
+		const content = document.getElementById('previewContent');
+		if (!viewport || !content) return;
+
+		let scale = 1;
+		let originX = 50; // 百分比
+		let originY = 50;
+
+		function updateTransform() {
+			content.style.transformOrigin = `${originX}% ${originY}%`;
+			content.style.transform = `scale(${scale})`;
+		}
+
+		// 滚轮缩放（以鼠标位置为中心）
+		viewport.addEventListener('wheel', (e) => {
+			e.preventDefault();
+			const rect = viewport.getBoundingClientRect();
+			// 鼠标在视口中的百分比位置
+			originX = ((e.clientX - rect.left) / rect.width) * 100;
+			originY = ((e.clientY - rect.top) / rect.height) * 100;
+			const delta = e.deltaY > 0 ? 0.9 : 1.1;
+			scale = Math.max(0.1, Math.min(20, scale * delta));
+			updateTransform();
+		}, { passive: false });
+
+		// 双击重置
+		viewport.addEventListener('dblclick', () => {
+			scale = 1;
+			originX = 50;
+			originY = 50;
+			updateTransform();
+		});
+	}
+
 	// ============ 绑定操作 ============
 
 	/** 从更多匹配结果中选择一个候选器件 */
@@ -2285,18 +3022,20 @@
 		}
 
 		// 显示搜索框弹窗
-		modalContainer.innerHTML = `<div class="modal-overlay" id="fpMatchOverlay" onclick="if(event.target===this)this.remove()">
+		modalContainer.innerHTML = `<div class="modal-overlay" id="fpMatchOverlay">
 			<div class="modal" style="width:700px;">
-				<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+				<div class="modal-header">
 					<h3>${i18n('🔍 封装库匹配 - ${1}', g.designatorStr)}</h3>
 					<button class="btn-icon" onclick="this.closest('.modal-overlay').remove()">✕</button>
 				</div>
-				<div style="display:flex;gap:8px;margin-bottom:16px;">
-					<input type="text" id="fpSearchInput" class="search-input" placeholder="${i18n('输入封装关键词搜索...')}" style="flex:1;" value="${defaultKeyword}">
-					<button class="btn btn-primary btn-sm" onclick="window.__app.doFootprintSearch('${k}')">${i18n('搜索')}</button>
-				</div>
-				<div id="fpSearchResults" style="max-height:500px;overflow-y:auto;">
-					<div style="text-align:center;padding:20px;color:var(--text-muted);">${i18n('输入关键词搜索封装库')}</div>
+				<div class="modal-body">
+					<div style="display:flex;gap:8px;margin-bottom:16px;">
+						<input type="text" id="fpSearchInput" class="search-input" placeholder="${i18n('输入封装关键词搜索...')}" style="flex:1;" value="${defaultKeyword}">
+						<button class="btn btn-primary btn-sm" onclick="window.__app.doFootprintSearch('${k}')">${i18n('搜索')}</button>
+					</div>
+					<div id="fpSearchResults">
+						<div style="text-align:center;padding:20px;color:var(--text-muted);">${i18n('输入关键词搜索封装库')}</div>
+					</div>
 				</div>
 			</div>
 		</div>`;
@@ -2362,7 +3101,7 @@
 				const isBest = idx === 0;
 				html += `<div class="candidate-item" onclick="window.__app.selectFootprint('${k}', ${idx})" style="display:flex;align-items:center;gap:16px;padding:12px;${isBest ? 'border:2px solid var(--primary);' : ''}">
 					<div style="min-width:100px;text-align:center;">
-						${fp.renderUrl ? `<img src="${fp.renderUrl}" style="max-width:90px;max-height:60px;object-fit:contain;">` : `<div style="width:90px;height:60px;background:#f8fafc;border-radius:4px;display:flex;align-items:center;justify-content:center;color:var(--text-muted);font-size:11px;">${i18n('无预览')}</div>`}
+						${fp.renderUrl ? `<img src="${fp.renderUrl}" style="max-width:90px;max-height:60px;object-fit:contain;">` : `<div style="width:90px;height:60px;background:var(--bg-image);border-radius:4px;display:flex;align-items:center;justify-content:center;color:var(--text-muted);font-size:11px;">${i18n('无预览')}</div>`}
 					</div>
 					<div style="flex:1;min-width:0;">
 						<div style="font-weight:500;font-size:14px;">${fp.name}</div>
@@ -2412,13 +3151,27 @@
 
 		showToast(i18n('正在绑定 ${1}...', g.designatorStr), 'info');
 
-		// 封装降级结果：强制使用 footprint 绑定模式
-		const origBindMode = bindMode;
-		if (mr?.footprintOnly)
-			bindMode = 'footprint';
+		// 封装降级结果：只有封装数据，强制保留符号
+		const origBindOptions = { ...bindOptions };
+		if (mr?.footprintOnly) {
+			bindOptions = { ...bindOptions, keepSymbol: true, keepFootprint: false };
+		}
+
+		// 显示进度条
+		const progressBar = $('#progressBar');
+		const progressFill = $('#progressFill');
+		const progressText = $('#progressText');
+		if (progressBar) show(progressBar);
 
 		let successCount = 0;
-		for (const d of g.designatorList) {
+		const total = g.designatorList.length;
+		for (let i = 0; i < total; i++) {
+			const d = g.designatorList[i];
+			// 更新进度
+			const pct = Math.round((i / total) * 100);
+			if (progressFill) progressFill.style.width = `${pct}%`;
+			if (progressText) progressText.textContent = i18n('绑定中 ${1}/${2}', i + 1, total);
+
 			const primitiveId = g._primitiveIds[d] || designatorToPrimitiveId[d];
 			if (!primitiveId) {
 				console.warn(PLUGIN_TAG, 'No primitiveId for', d);
@@ -2437,6 +3190,11 @@
 			}
 		}
 
+		// 完成进度
+		if (progressFill) progressFill.style.width = '100%';
+		if (progressText) progressText.textContent = i18n('绑定完成');
+		setTimeout(() => { if (progressBar) hide(progressBar); }, 1500);
+
 		if (successCount > 0) {
 			renderTable(searchInput.value);
 			viewDetail(k);
@@ -2446,7 +3204,7 @@
 			showToast(i18n('绑定失败，请查看控制台日志'), 'error');
 		}
 
-		bindMode = origBindMode;
+		bindOptions = origBindOptions;
 	}
 
 	async function unbindGroup(k) {
@@ -2456,8 +3214,20 @@
 
 		showToast(i18n('正在还原器件...'), 'info');
 
+		// 显示进度条
+		const progressBar = $('#progressBar');
+		const progressFill = $('#progressFill');
+		const progressText = $('#progressText');
+		if (progressBar) show(progressBar);
+
 		let restoreCount = 0;
-		for (const d of g.designatorList) {
+		const total = g.designatorList.length;
+		for (let i = 0; i < total; i++) {
+			const d = g.designatorList[i];
+			// 更新进度
+			const pct = Math.round((i / total) * 100);
+			if (progressFill) progressFill.style.width = `${pct}%`;
+			if (progressText) progressText.textContent = i18n('解绑中 ${1}/${2}', i + 1, total);
 			const status = bindStatus[d];
 			if (!status?.bound || !status.originalInfo) {
 				bindStatus[d] = { bound: false, deviceInfo: null };
@@ -2525,6 +3295,11 @@
 			bindStatus[d] = { bound: false, deviceInfo: null };
 		}
 
+		// 完成进度
+		if (progressFill) progressFill.style.width = '100%';
+		if (progressText) progressText.textContent = i18n('解绑完成');
+		setTimeout(() => { if (progressBar) hide(progressBar); }, 1500);
+
 		renderTable(searchInput.value);
 		if (!detailPanel.classList.contains('collapsed'))
 			viewDetail(k);
@@ -2539,8 +3314,22 @@
 		}
 
 		showToast(i18n('正在批量绑定 ${1} 个器件...', toBind.length), 'info');
+
+		// 显示进度条
+		const progressBar = $('#progressBar');
+		const progressFill = $('#progressFill');
+		const progressText = $('#progressText');
+		if (progressBar) show(progressBar);
+
 		let count = 0;
-		for (const d of toBind) {
+		const total = toBind.length;
+		for (let i = 0; i < total; i++) {
+			const d = toBind[i];
+			// 更新进度
+			const pct = Math.round((i / total) * 100);
+			if (progressFill) progressFill.style.width = `${pct}%`;
+			if (progressText) progressText.textContent = i18n('批量绑定 ${1}/${2}', i + 1, total);
+
 			const g = bomData.find(x => x.designatorList.includes(d));
 			if (!g)
 				continue;
@@ -2550,12 +3339,23 @@
 			const primitiveId = g._primitiveIds[d] || designatorToPrimitiveId[d];
 			if (!primitiveId)
 				continue;
-			const ok = await bindComponent(primitiveId, mr.bestMatch);
-			if (ok) {
-				bindStatus[d] = { bound: true, deviceInfo: { ...mr.bestMatch } };
+			const result = await bindComponent(primitiveId, mr.bestMatch);
+			if (result) {
+				bindStatus[d] = {
+					bound: true,
+					deviceInfo: { ...mr.bestMatch },
+					originalInfo: result.saved,
+					newPrimitiveId: result.newPrimitiveId,
+				};
 				count++;
 			}
 		}
+
+		// 完成进度
+		if (progressFill) progressFill.style.width = '100%';
+		if (progressText) progressText.textContent = i18n('批量绑定完成');
+		setTimeout(() => { if (progressBar) hide(progressBar); }, 1500);
+
 		renderTable(searchInput.value);
 		showToast(i18n('✅ 批量绑定完成 ${1}/${2}', count, toBind.length), 'success');
 	}
@@ -2569,20 +3369,24 @@
 			return;
 		const keyword = g.mpn || g.pkg || '';
 
-		modalContainer.innerHTML = `<div class="modal-overlay" id="manualOverlay" onclick="if(event.target===this)this.remove()">
+		modalContainer.innerHTML = `<div class="modal-overlay" id="manualOverlay">
 			<div class="modal" style="width:700px;">
-				<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+				<div class="modal-header">
 					<h3>${i18n('🔍 人工搜索器件 - ${1}', g.designatorStr)}</h3>
 					<button class="btn-icon" onclick="this.closest('.modal-overlay').remove()">✕</button>
 				</div>
-				<div class="pkg-search-row" style="margin-bottom:12px;">
-					<input type="text" class="search-input" id="manualSearch" value="${keyword}" placeholder="${i18n('输入型号/关键词搜索...')}" style="width:100%;">
-					<button class="btn btn-primary btn-sm" onclick="window.__app.doManualSearch()">${i18n('搜索')}</button>
+				<div class="modal-body">
+					<div class="pkg-search-row" style="margin-bottom:12px;">
+						<input type="text" class="search-input" id="manualSearch" value="${keyword}" placeholder="${i18n('输入型号/关键词搜索...')}" style="width:100%;">
+						<button class="btn btn-primary btn-sm" onclick="window.__app.doManualSearch()">${i18n('搜索')}</button>
+					</div>
+					<div id="manualList">
+						<div style="text-align:center;padding:20px;color:var(--text-muted);">${i18n('输入关键词搜索器件库')}</div>
+					</div>
 				</div>
-				<div id="manualList" style="max-height:500px;overflow-y:auto;">
-					<div style="text-align:center;padding:20px;color:var(--text-muted);">${i18n('输入关键词搜索器件库')}</div>
+				<div class="modal-footer">
+					<button class="btn btn-outline btn-sm" onclick="this.closest('.modal-overlay').remove()">${i18n('关闭')}</button>
 				</div>
-				<button class="btn btn-outline" style="width:100%;margin-top:12px;" onclick="this.closest('.modal-overlay').remove()">${i18n('关闭')}</button>
 			</div>
 		</div>`;
 
@@ -2613,7 +3417,7 @@
 			const d = sliced[i];
 			const imgHtml = d.imageUrl
 				? `<img src="${d.imageUrl}" style="max-width:70px;max-height:50px;object-fit:contain;" onerror="this.style.display='none'">`
-				: `<div style="width:70px;height:50px;background:#f8fafc;border-radius:4px;display:flex;align-items:center;justify-content:center;color:var(--text-muted);font-size:10px;">${i18n('无图片')}</div>`;
+				: `<div style="width:70px;height:50px;background:var(--bg-image);border-radius:4px;display:flex;align-items:center;justify-content:center;color:var(--text-muted);font-size:10px;">${i18n('无图片')}</div>`;
 			const descText = d.description ? `${d.description.substring(0, 50)}...` : '-';
 			html += `<div class="candidate-item" onclick="window.__app.selectManualDevice(${i})" data-idx="${i}" style="display:flex;align-items:center;gap:12px;padding:12px;">
 					<div class="manual-device-img" id="manualImg${i}" style="min-width:80px;text-align:center;">${imgHtml}</div>
@@ -2682,36 +3486,41 @@
 			desc: dev?.desc || dev?.description || '',
 		};
 
-		modalContainer.innerHTML = `<div class="modal-overlay" id="editOverlay" onclick="if(event.target===this)this.remove()">
+		modalContainer.innerHTML = `<div class="modal-overlay" id="editOverlay">
 			<div class="modal" style="width:620px;">
-				<h3 style="margin-bottom:14px;">${i18n('编辑器件参数 - ${1}', g.designatorStr)}</h3>
-				${dev?.imageUrl ? `<div style="text-align:center;padding:8px;background:#f8fafc;border-radius:8px;margin-bottom:12px;"><img src="${dev.imageUrl}" style="max-width:180px;max-height:120px;object-fit:contain;" onerror="this.style.display='none'"></div>` : ''}
-				<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
-					<div>
-						<label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:4px;">${i18n('型号/名称')}</label>
-						<input id="emn" value="${deviceFields.name}" style="width:100%;padding:7px 10px;border:1px solid var(--border);border-radius:4px;font-size:13px;">
-					</div>
-					<div>
-						<label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:4px;">${i18n('封装')}</label>
-						<input id="ep" value="${deviceFields.package}" style="width:100%;padding:7px 10px;border:1px solid var(--border);border-radius:4px;font-size:13px;">
-					</div>
-					<div>
-						<label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:4px;">${i18n('LCSC编号')}</label>
-						<div style="display:flex;gap:4px;">
-							<input id="elc" value="${deviceFields.lcsc}" style="flex:1;padding:7px 10px;border:1px solid var(--border);border-radius:4px;font-size:13px;">
-							<button class="btn btn-outline btn-sm" onclick="window.__app.loadByLcsc()" title="${i18n('通过C编号检索器件')}">🔍</button>
+				<div class="modal-header">
+					<h3>${i18n('编辑器件参数 - ${1}', g.designatorStr)}</h3>
+					<button class="btn-icon" onclick="this.closest('.modal-overlay').remove()">✕</button>
+				</div>
+				<div class="modal-body">
+					${dev?.imageUrl ? `<div style="text-align:center;padding:8px;background:var(--bg-image);border-radius:8px;margin-bottom:12px;"><img src="${dev.imageUrl}" style="max-width:180px;max-height:120px;object-fit:contain;" onerror="this.style.display='none'"></div>` : ''}
+					<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+						<div>
+							<label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:4px;">${i18n('型号/名称')}</label>
+							<input id="emn" value="${deviceFields.name}" style="width:100%;padding:7px 10px;border:1px solid var(--border);border-radius:4px;font-size:13px;">
+						</div>
+						<div>
+							<label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:4px;">${i18n('封装')}</label>
+							<input id="ep" value="${deviceFields.package}" style="width:100%;padding:7px 10px;border:1px solid var(--border);border-radius:4px;font-size:13px;">
+						</div>
+						<div>
+							<label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:4px;">${i18n('LCSC编号')}</label>
+							<div style="display:flex;gap:4px;">
+								<input id="elc" value="${deviceFields.lcsc}" style="flex:1;padding:7px 10px;border:1px solid var(--border);border-radius:4px;font-size:13px;">
+								<button class="btn btn-outline btn-sm" onclick="window.__app.loadByLcsc()" title="${i18n('通过C编号检索器件')}">🔍</button>
+							</div>
+						</div>
+						<div>
+							<label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:4px;">${i18n('制造商')}</label>
+							<input id="emf" value="${deviceFields.mfr}" style="width:100%;padding:7px 10px;border:1px solid var(--border);border-radius:4px;font-size:13px;">
+						</div>
+						<div style="grid-column:1/3;">
+							<label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:4px;">${i18n('描述')}</label>
+							<input id="ed" value="${deviceFields.desc}" style="width:100%;padding:7px 10px;border:1px solid var(--border);border-radius:4px;font-size:13px;">
 						</div>
 					</div>
-					<div>
-						<label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:4px;">${i18n('制造商')}</label>
-						<input id="emf" value="${deviceFields.mfr}" style="width:100%;padding:7px 10px;border:1px solid var(--border);border-radius:4px;font-size:13px;">
-					</div>
-					<div style="grid-column:1/3;">
-						<label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:4px;">${i18n('描述')}</label>
-						<input id="ed" value="${deviceFields.desc}" style="width:100%;padding:7px 10px;border:1px solid var(--border);border-radius:4px;font-size:13px;">
-					</div>
 				</div>
-				<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px;">
+				<div class="modal-footer">
 					<button class="btn btn-outline" onclick="this.closest('.modal-overlay').remove()">${i18n('取消')}</button>
 					<button class="btn btn-primary" id="sbtn">${i18n('保存并绑定')}</button>
 				</div>
@@ -2764,19 +3573,24 @@
 			return;
 		}
 
-		modalContainer.innerHTML = `<div class="modal-overlay" onclick="if(event.target===this)this.remove()">
+		modalContainer.innerHTML = `<div class="modal-overlay">
 			<div class="modal">
-				<h3 style="margin-bottom:12px;">⚠️ ${i18n('DRC检查结果（${1} 项）', errors.length)}</h3>
-				<div style="max-height:400px;overflow-y:auto;">
+				<div class="modal-header">
+					<h3>⚠️ ${i18n('DRC检查结果（${1} 项）', errors.length)}</h3>
+					<button class="btn-icon" onclick="this.closest('.modal-overlay').remove()">✕</button>
+				</div>
+				<div class="modal-body">
 					${errors
 		.map(
-			(e, i) => `<div style="background:#fffbeb;padding:10px 12px;margin:6px 0;border-radius:6px;font-size:12px;">
+			(e, i) => `<div style="background:var(--bg-warning);padding:10px 12px;margin:6px 0;border-radius:6px;font-size:12px;">
 								<b>#${i + 1}</b> ${typeof e === 'string' ? e : JSON.stringify(e)}
 							</div>`,
 		)
 		.join('')}
 				</div>
-				<button class="btn btn-outline" style="width:100%;margin-top:12px;" onclick="this.closest('.modal-overlay').remove()">${i18n('关闭')}</button>
+				<div class="modal-footer">
+					<button class="btn btn-outline btn-sm" onclick="this.closest('.modal-overlay').remove()">${i18n('关闭')}</button>
+				</div>
 			</div>
 		</div>`;
 	}
@@ -2850,17 +3664,22 @@
 		const allCols = [i18n('设计位号'), ...bomColumns, ...deviceKeys.map(k => `绑定-${k}`)];
 		const defaultSelected = [i18n('设计位号'), ...bomColumns.filter(c => !c.startsWith('_')), `绑定-name`, `绑定-package`, `绑定-lcsc`];
 
-		modalContainer.innerHTML = `<div class="modal-overlay" onclick="if(event.target===this)this.remove()">
+		modalContainer.innerHTML = `<div class="modal-overlay">
 			<div class="modal" style="width:650px;">
-				<h3 style="margin-bottom:14px;">${i18n('自定义导出列')}</h3>
-				<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;max-height:400px;overflow-y:auto;">
-					${allCols
+				<div class="modal-header">
+					<h3>${i18n('自定义导出列')}</h3>
+					<button class="btn-icon" onclick="this.closest('.modal-overlay').remove()">✕</button>
+				</div>
+				<div class="modal-body">
+					<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;">
+						${allCols
 		.map(
 			c => `<label style="padding:6px 8px;font-size:13px;"><input type="checkbox" value="${c}" ${defaultSelected.includes(c) ? 'checked' : ''}> ${c}</label>`,
 		)
 		.join('')}
+					</div>
 				</div>
-				<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px;">
+				<div class="modal-footer">
 					<button class="btn btn-outline" onclick="this.closest('.modal-overlay').remove()">${i18n('取消')}</button>
 					<button class="btn btn-primary" id="deb">${i18n('导出')}</button>
 				</div>
@@ -3050,6 +3869,8 @@
 		window.__app = {
 			viewDetail,
 			closeDetail,
+			previewImage,
+			previewRender,
 			editOrBind,
 			manualMatch,
 			bindGroup,
@@ -3078,7 +3899,6 @@
 			aiMatchAll,
 			openSettingsModal,
 			saveAndCloseSettings,
-			onBindModeChange,
 			selectCandidate,
 			matchFootprintOnly,
 			doFootprintSearch,
@@ -3088,6 +3908,18 @@
 			clearMatchColumns,
 			removeMatchColumn,
 			exportResult,
+			openColumnConfigModal,
+			toggleColumn,
+			onLibraryChange,
+			toggleColumnSort,
+			onColumnDragStart,
+			onColumnDragOver,
+			onColumnDragEnter,
+			onColumnDragLeave,
+			onColumnDrop,
+			onColumnDragEnd,
+			addCustomColumn,
+			removeCustomColumn,
 		};
 		window.editOrBind = editOrBind;
 		window.manualMatch = manualMatch;
@@ -3099,6 +3931,15 @@
 		detailPanel.classList.add('collapsed');
 		document.getElementById('zoomSlider').addEventListener('input', updateZoom);
 		updateZoom();
+
+		// 初始化主题
+		await initTheme();
+
+		// 加载列配置
+		await loadColumnConfig();
+
+		// 加载库列表
+		await loadLibraryList();
 
 		// 加载 AI 设置
 		await loadAISettings();
@@ -3126,6 +3967,7 @@
 
 			// 提取器件数据
 			const rows = [];
+			const preBindStatus = {}; // 记录已绑定的器件
 			for (const comp of components) {
 				const designator = comp.getState_Designator() ?? '';
 				const primitiveId = comp.getState_PrimitiveId() ?? '';
@@ -3161,6 +4003,45 @@
 					}
 				}
 
+				// 检测器件是否已绑定（根据用户配置的检测逻辑）
+				const hasDevice = !!componentInfo?.uuid;
+				const hasEasyedaFp = !!footprintInfo?.uuid;
+				const hasLcsc = !!(other?.LCSC || other?.['Supplier Part'] || other?.['立创编号']);
+				let isBound = false;
+				if (bindDetectMode === 'fp') {
+					isBound = hasDevice && hasEasyedaFp;
+				}
+				else if (bindDetectMode === 'lcsc') {
+					isBound = hasDevice && hasLcsc;
+				}
+				else if (bindDetectMode === 'fp_or_lcsc') {
+					isBound = hasDevice && (hasEasyedaFp || hasLcsc);
+				}
+				else {
+					isBound = hasDevice;
+				}
+
+				if (isBound) {
+					const desigs = normalizeDesignators(effectiveDesig);
+					const devName = componentInfo.name || '';
+					const fpName = footprintInfo?.name || other?.['Origin Footprint'] || '';
+					const lcscPart = other?.LCSC || other?.['Supplier Part'] || other?.['立创编号'] || '';
+					const mfr = other?.Manufacturer || '';
+					for (const d of desigs) {
+						preBindStatus[d] = {
+							bound: true,
+							deviceInfo: {
+								name: devName,
+								package: fpName,
+								lcsc: lcscPart,
+								manufacturer: mfr,
+								libraryUuid: componentInfo.libraryUuid || '',
+								uuid: componentInfo.uuid,
+							},
+						};
+					}
+				}
+
 				rows.push(row);
 			}
 
@@ -3171,9 +4052,11 @@
 			selectedDesignators.clear();
 			expandedDesignatorSets.clear();
 			selectedCandidateIdx = {};
-			// 清空 const 对象的属性（不能重新赋值）
 			Object.keys(designatorToPrimitiveId).forEach(k => delete designatorToPrimitiveId[k]);
 			Object.keys(searchCache).forEach(k => delete searchCache[k]);
+
+			// 恢复已绑定状态
+			Object.assign(bindStatus, preBindStatus);
 
 			// 分组
 			const headers = Object.keys(rows[0] || {});
@@ -3189,7 +4072,8 @@
 			}
 
 			const count = bomData.length;
-			statusText.innerHTML = `<span class="status-dot connected"></span> ${i18n('数据来源：原理图器件（${1} 组）', count)}`;
+			const totalCount = bomData.reduce((n, g) => n + g.designatorList.length, 0);
+			statusText.innerHTML = `<span class="status-dot connected"></span> ${i18n('数据来源：原理图器件（${1} 组，${2} 个）', count, totalCount)}`;
 			showUI();
 			showToast(i18n('已加载 ${1} 组器件，点击匹配按钮开始匹配', count), 'info');
 		}
