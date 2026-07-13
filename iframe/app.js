@@ -15,12 +15,13 @@
 	let bomData = []; // 分组后的 BOM 数据
 	let matchResults = {}; // 匹配结果缓存 { groupKey: { bestMatch, candidates, matchScore } }
 	let bindStatus = {}; // 绑定状态 { designator: { bound, deviceInfo } }
+	let currentDetailKey = ''; // 当前详情面板展示的分组 key
 	let selectedCandidateIdx = {}; // { groupKey: number } 当前选中的候选索引
 	const selectedDesignators = new Set();
 	let bomColumns = []; // BOM 原始列名
 
 	let matchColumns = []; // 匹配依据列（多选）
-	let matchTarget = 'device'; // 匹配目标：'device'=器件库, 'symbol'=符号库, 'footprint'=封装库
+	const matchTarget = 'device'; // 匹配目标：'device'=器件库, 'symbol'=符号库, 'footprint'=封装库
 	let libraryList = []; // 库列表 [{name, uuid}]
 	let specialLibraries = []; // 特殊库 [{name, uuid}]（收藏/个人/工程/系统）
 	let selectedLibraryUuid = ''; // 选中的库 UUID（空=全部库）
@@ -31,9 +32,9 @@
 	const aiSettings = { enabled: false, apiUrl: '', apiKey: '', model: 'gpt-4o-mini', batchSend: false, contextSize: 128 }; // AI 设置（contextSize 单位: K tokens）
 	// 绑定选项（三个复选框）
 	let bindOptions = {
-		keepDesignatorId: true,  // 保留位号和唯一ID
-		keepSymbol: true,        // 保留当前符号
-		keepFootprint: false,    // 保留当前封装
+		keepDesignatorId: true, // 保留位号和唯一ID
+		keepSymbol: true, // 保留当前符号
+		keepFootprint: false, // 保留当前封装
 	};
 	// 绑定检测逻辑：'fp'=检查EasyEDA封装, 'lcsc'=检查LCSC, 'fp_or_lcsc'=封装或LCSC, 'any'=有器件即可
 	let bindDetectMode = 'fp_or_lcsc';
@@ -45,7 +46,7 @@
 	let lastSystemTheme = 'light';
 
 	// ============ 表格列配置 ============
-	let tableColumns = [
+	const tableColumns = [
 		{ key: 'checkbox', label: '', visible: true, fixed: true, width: 55, sortable: false },
 		{ key: 'designator', label: '位号', visible: true, fixed: false, width: 150, sortable: true },
 		{ key: 'mpn', label: '型号', visible: true, fixed: false, width: 180, sortable: true },
@@ -54,9 +55,11 @@
 		{ key: 'matchResult', label: '匹配结果', visible: true, fixed: false, width: 200, sortable: false },
 		{ key: 'matchScore', label: '匹配度', visible: true, fixed: false, width: 100, sortable: true },
 		{ key: 'bindStatus', label: '绑定', visible: true, fixed: false, width: 80, sortable: true },
+		{ key: 'boundPackage', label: '绑定封装', visible: true, fixed: false, width: 130, sortable: true },
+		{ key: 'boundSymbol', label: '绑定符号', visible: true, fixed: false, width: 130, sortable: true },
 		{ key: 'actions', label: '操作', visible: true, fixed: true, width: 200, sortable: false },
 	];
-	let sortState = { key: '', direction: '' }; // direction: 'asc' | 'desc' | ''
+	const sortState = { key: '', direction: '' }; // direction: 'asc' | 'desc' | ''
 	let columnResizeState = { active: false, colKey: '', startX: 0, startWidth: 0 };
 
 	// ============ DOM 引用 ============
@@ -146,7 +149,8 @@
 	async function initTheme() {
 		try {
 			const saved = await eda.sys_Storage.getExtensionUserConfig('themePreference');
-			if (saved) themePreference = saved;
+			if (saved)
+				themePreference = saved;
 		}
 		catch (err) {
 			console.warn(PLUGIN_TAG, 'Failed to load theme preference:', err);
@@ -161,7 +165,8 @@
 		// 轮询系统主题（仅 auto 模式）
 		try {
 			eda.sys_Timer.setIntervalTimer('theme-poll', 3000, async () => {
-				if (themePreference !== 'auto') return;
+				if (themePreference !== 'auto')
+					return;
 				try {
 					const t = await eda.sys_Window.getCurrentTheme();
 					if (t !== lastSystemTheme) {
@@ -184,10 +189,12 @@
 		const theme = themePreference === 'auto' ? lastSystemTheme : themePreference;
 		document.documentElement.dataset.theme = theme;
 		const btn = document.getElementById('btnTheme');
-		if (btn) btn.textContent = theme === 'dark' ? '☀️' : '🌙';
+		if (btn)
+			btn.textContent = theme === 'dark' ? '☀️' : '🌙';
 	}
 
 	/** 切换主题偏好 */
+	// eslint-disable-next-line no-unused-vars, unused-imports/no-unused-vars
 	async function toggleTheme() {
 		if (themePreference === 'auto') {
 			// 当前跟随系统 → 手动切到相反主题
@@ -277,7 +284,8 @@
 	/** 动态渲染表头 */
 	function renderTableHead() {
 		const thead = document.getElementById('tableHead');
-		if (!thead) return;
+		if (!thead)
+			return;
 		const visibleCols = tableColumns.filter(c => c.visible);
 		let html = '<tr>';
 		for (const col of visibleCols) {
@@ -309,7 +317,8 @@
 				e.stopPropagation();
 				const colKey = handle.dataset.col;
 				const col = tableColumns.find(c => c.key === colKey);
-				if (!col) return;
+				if (!col)
+					return;
 				columnResizeState = { active: true, colKey, startX: e.clientX, startWidth: col.width };
 				handle.classList.add('active');
 				document.addEventListener('mousemove', onColumnResizeMove);
@@ -319,7 +328,8 @@
 	}
 
 	function onColumnResizeMove(e) {
-		if (!columnResizeState.active) return;
+		if (!columnResizeState.active)
+			return;
 		const diff = e.clientX - columnResizeState.startX;
 		const newWidth = Math.max(40, columnResizeState.startWidth + diff);
 		const col = tableColumns.find(c => c.key === columnResizeState.colKey);
@@ -360,27 +370,35 @@
 
 	function onColumnDragEnter(e, key) {
 		e.preventDefault();
-		if (key === dragSourceColKey) return;
+		if (key === dragSourceColKey)
+			return;
 		const th = e.target.closest('th');
-		if (th) th.classList.add('drag-over');
+		if (th)
+			th.classList.add('drag-over');
 	}
 
 	function onColumnDragLeave(e) {
 		const th = e.target.closest('th');
-		if (th) th.classList.remove('drag-over');
+		if (th)
+			th.classList.remove('drag-over');
 	}
 
 	function onColumnDrop(e, targetKey) {
 		e.preventDefault();
 		const th = e.target.closest('th');
-		if (th) th.classList.remove('drag-over');
-		if (!dragSourceColKey || dragSourceColKey === targetKey) return;
-		if (dragSourceColKey === 'checkbox' || targetKey === 'checkbox') return;
-		if (dragSourceColKey === 'actions' || targetKey === 'actions') return;
+		if (th)
+			th.classList.remove('drag-over');
+		if (!dragSourceColKey || dragSourceColKey === targetKey)
+			return;
+		if (dragSourceColKey === 'checkbox' || targetKey === 'checkbox')
+			return;
+		if (dragSourceColKey === 'actions' || targetKey === 'actions')
+			return;
 
 		const srcIdx = tableColumns.findIndex(c => c.key === dragSourceColKey);
 		const tgtIdx = tableColumns.findIndex(c => c.key === targetKey);
-		if (srcIdx < 0 || tgtIdx < 0) return;
+		if (srcIdx < 0 || tgtIdx < 0)
+			return;
 
 		// 移动列位置
 		const [moved] = tableColumns.splice(srcIdx, 1);
@@ -418,7 +436,8 @@
 
 	/** 对数据排序 */
 	function sortData(data) {
-		if (!sortState.key || !sortState.direction) return data;
+		if (!sortState.key || !sortState.direction)
+			return data;
 		const dir = sortState.direction === 'asc' ? 1 : -1;
 		return [...data].sort((a, b) => {
 			const k = sortState.key;
@@ -452,6 +471,14 @@
 				const bb = b.designatorList.every(d => bindStatus[d]?.bound) ? 1 : 0;
 				return (ab - bb) * dir;
 			}
+			else if (k === 'boundPackage') {
+				va = a.designatorList.map(d => bindStatus[d]?.deviceInfo?.package || '').find(Boolean) || '';
+				vb = b.designatorList.map(d => bindStatus[d]?.deviceInfo?.package || '').find(Boolean) || '';
+			}
+			else if (k === 'boundSymbol') {
+				va = a.designatorList.map(d => bindStatus[d]?.deviceInfo?.name || '').find(Boolean) || '';
+				vb = b.designatorList.map(d => bindStatus[d]?.deviceInfo?.name || '').find(Boolean) || '';
+			}
 			else if (k.startsWith('custom_')) {
 				// 自定义列排序：从 _raw 中读取
 				const rawKey = k.slice(7);
@@ -480,11 +507,12 @@
 					<span>${col.label}</span>
 					${removeBtn}
 				</div>`;
-			}).join('');
+			})
+			.join('');
 
 		// 可添加的 BOM 列
 		const existingKeys = new Set(tableColumns.map(c => c.key));
-		const availableCols = bomColumns.filter(h => !existingKeys.has('custom_' + h));
+		const availableCols = bomColumns.filter(h => !existingKeys.has(`custom_${h}`));
 		const addHtml = availableCols.length > 0
 			? `<div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--border);">
 				<div style="font-size:12px;color:var(--text-secondary);margin-bottom:6px;">${i18n('添加BOM数据列')}</div>
@@ -518,7 +546,8 @@
 	/** 列设置弹窗内的拖拽排序 */
 	function initColumnDragSort() {
 		const list = document.getElementById('colSortList');
-		if (!list) return;
+		if (!list)
+			return;
 		let dragItem = null;
 
 		list.querySelectorAll('.col-item').forEach((item) => {
@@ -530,7 +559,8 @@
 			});
 
 			item.addEventListener('dragend', () => {
-				if (dragItem) dragItem.classList.remove('col-dragging');
+				if (dragItem)
+					dragItem.classList.remove('col-dragging');
 				dragItem = null;
 				list.querySelectorAll('.col-drag-over').forEach(el => el.classList.remove('col-drag-over'));
 			});
@@ -550,13 +580,15 @@
 			item.addEventListener('drop', (e) => {
 				e.preventDefault();
 				item.classList.remove('col-drag-over');
-				if (!dragItem || item === dragItem) return;
+				if (!dragItem || item === dragItem)
+					return;
 
 				const fromKey = dragItem.dataset.key;
 				const toKey = item.dataset.key;
 				const fromIdx = tableColumns.findIndex(c => c.key === fromKey);
 				const toIdx = tableColumns.findIndex(c => c.key === toKey);
-				if (fromIdx < 0 || toIdx < 0) return;
+				if (fromIdx < 0 || toIdx < 0)
+					return;
 
 				// 移动位置
 				const [moved] = tableColumns.splice(fromIdx, 1);
@@ -584,8 +616,9 @@
 
 	/** 添加自定义 BOM 数据列 */
 	function addCustomColumn(header) {
-		const key = 'custom_' + header;
-		if (tableColumns.find(c => c.key === key)) return;
+		const key = `custom_${header}`;
+		if (tableColumns.find(c => c.key === key))
+			return;
 		// 在 actions 列之前插入
 		const actionsIdx = tableColumns.findIndex(c => c.key === 'actions');
 		tableColumns.splice(actionsIdx, 0, {
@@ -646,7 +679,8 @@
 	/** 渲染库选择下拉框 */
 	function renderLibrarySelect() {
 		const select = document.getElementById('librarySelect');
-		if (!select) return;
+		if (!select)
+			return;
 		let html = `<option value="">${i18n('全部库')}</option>`;
 		// 特殊库（分组）
 		if (specialLibraries.length) {
@@ -1101,7 +1135,21 @@
 
 	// ============ 渲染图获取 ============
 
-	const renderImageCache = {}; // { "symbol:uuid": dataUrl, "footprint:uuid": dataUrl }
+	const renderImageCache = {}; // { "symbol:uuid:lib": dataUrl, "footprint:uuid:lib": dataUrl }
+	let systemLibraryUuid = ''; // 系统库 UUID（懒加载，LCSC 器件符号/封装渲染图所在库）
+
+	/** 获取系统库 UUID（缓存） */
+	async function getSystemLibraryUuid() {
+		if (systemLibraryUuid)
+			return systemLibraryUuid;
+		try {
+			systemLibraryUuid = (await eda.lib_LibrariesList.getSystemLibraryUuid()) || '';
+		}
+		catch (e) {
+			console.warn(PLUGIN_TAG, 'getSystemLibraryUuid failed', e);
+		}
+		return systemLibraryUuid;
+	}
 
 	/** Blob → data URL（浏览器 FileReader） */
 	function blobToDataUrl(blob) {
@@ -1113,55 +1161,134 @@
 	}
 
 	/**
-	 * 获取器件的符号渲染图和封装渲染图
-	 * 按需获取并缓存，返回 { symbolUrl, footprintUrl }
+	 * 按 (uuid, 库) 候选组合逐个尝试获取渲染图，命中即返回 data URL。
+	 * 背景：原理图器件 getState_Symbol()/getState_Footprint() 的 uuid 为实例ID，
+	 * libraryUuid 才是可渲染的定义ID；且 LCSC 器件的符号/封装渲染图在系统库。
+	 * 因此对每个实体尝试多个 (uuid, libraryUuid) 组合，兼容搜索器件与已绑定器件。
 	 */
-	async function fetchRenderImages(device) {
-		if (!device?.symbolUuid && !device?.footprintUuid)
-			return {};
-		const libUuid = device.libraryUuid;
-		if (!libUuid)
-			return {};
-		const result = {};
-
-		// 符号渲染图
-		if (device.symbolUuid) {
-			const cacheKey = `symbol:${device.symbolUuid}`;
-			if (renderImageCache[cacheKey]) {
-				result.symbolUrl = renderImageCache[cacheKey];
-			}
-			else {
+	async function tryGetRenderImage(type, uuidCandidates, libCandidates) {
+		for (const uuid of uuidCandidates) {
+			if (!uuid)
+				continue;
+			for (const lib of libCandidates) {
+				if (!lib)
+					continue;
+				const cacheKey = `${type}:${uuid}:${lib}`;
+				if (renderImageCache[cacheKey])
+					return renderImageCache[cacheKey];
 				try {
-					const blob = await eda.lib_Symbol.getRenderImage({ symbolUuid: device.symbolUuid, libraryUuid: libUuid });
+					const param = type === 'symbol'
+						? { symbolUuid: uuid, libraryUuid: lib }
+						: { footprintUuid: uuid, libraryUuid: lib };
+					const api = type === 'symbol' ? eda.lib_Symbol : eda.lib_Footprint;
+					const blob = await api.getRenderImage(param);
 					if (blob) {
-						result.symbolUrl = await blobToDataUrl(blob);
-						renderImageCache[cacheKey] = result.symbolUrl;
+						const dataUrl = await blobToDataUrl(blob);
+						renderImageCache[cacheKey] = dataUrl;
+						return dataUrl;
 					}
 				}
-				catch (e) {
-					console.warn(PLUGIN_TAG, 'getRenderImage symbol failed', e);
+				catch {
+					// 该组合无效，尝试下一个候选
 				}
 			}
 		}
+		return null;
+	}
 
-		// 封装渲染图
-		if (device.footprintUuid) {
-			const cacheKey = `footprint:${device.footprintUuid}`;
-			if (renderImageCache[cacheKey]) {
-				result.footprintUrl = renderImageCache[cacheKey];
+	/** 短UUID → 可渲染长UUID 缓存 { shortUuid: {uuid, libraryUuid} | null } */
+	const renderableUuidCache = {};
+
+	/**
+	 * 对 Altium 导入器件的短UUID符号/封装，解析库中的可渲染长UUID。
+	 * 通过 lib_Xxx.get(短UUID, "project") 直接获取名字+所在库（非搜索），
+	 * 再 lib_Xxx.search(名字, 所在库) 拿到库中的长UUID正式版本。
+	 * @returns {{ uuid: string, libraryUuid: string } | null} 可渲染的长UUID及库，或 null
+	 */
+	async function resolveRenderableUuid(type, shortUuid) {
+		if (!shortUuid)
+			return null;
+		if (shortUuid in renderableUuidCache)
+			return renderableUuidCache[shortUuid];
+		try {
+			const api = type === 'symbol' ? eda.lib_Symbol : eda.lib_Footprint;
+			// 1. 用短UUID通过工程库直接 get（不是搜索），确认存在并拿到名字+所在库
+			const item = await api.get(shortUuid, 'project');
+			if (!item || !item.name || !item.libraryUuid) {
+				renderableUuidCache[shortUuid] = null;
+				return null;
 			}
-			else {
-				try {
-					const blob = await eda.lib_Footprint.getRenderImage({ footprintUuid: device.footprintUuid, libraryUuid: libUuid });
-					if (blob) {
-						result.footprintUrl = await blobToDataUrl(blob);
-						renderImageCache[cacheKey] = result.footprintUrl;
-					}
-				}
-				catch (e) {
-					console.warn(PLUGIN_TAG, 'getRenderImage footprint failed', e);
-				}
+			// 2. 在该库里按精确名字搜索，拿到长UUID（库中正式版本，同名同库精确匹配）
+			const results = await api.search(item.name, item.libraryUuid);
+			if (!Array.isArray(results) || !results.length) {
+				renderableUuidCache[shortUuid] = null;
+				return null;
 			}
+			const hit = { uuid: results[0].uuid, libraryUuid: results[0].libraryUuid };
+			renderableUuidCache[shortUuid] = hit;
+			return hit;
+		}
+		catch {
+			renderableUuidCache[shortUuid] = null;
+			return null;
+		}
+	}
+
+	/**
+	 * 获取器件的符号渲染图和封装渲染图
+	 * 分三层递进：
+	 *   1. 直接候选（短UUID × 各库）—— LCSC 标准器件命中
+	 *   2. 短UUID解析（get确认存在 + search取长UUID）—— Altium 导入器件命中
+	 * 返回 { symbolUrl, footprintUrl }
+	 */
+	async function fetchRenderImages(device) {
+		if (!device)
+			return {};
+		const hasSym = device.symbolUuid || device.symbolLibraryUuid;
+		const hasFp = device.footprintUuid || device.footprintLibraryUuid;
+		if (!hasSym && !hasFp)
+			return {};
+
+		const sysLib = await getSystemLibraryUuid();
+		const dedupe = (arr) => {
+			const out = [];
+			for (const v of arr) {
+				if (v && !out.includes(v))
+					out.push(v);
+			}
+			return out;
+		};
+
+		const result = {};
+
+		// 符号：优先用 libraryUuid 字段（已绑定器件的可渲染定义ID），库优先系统库
+		if (hasSym) {
+			const symUuids = dedupe([device.symbolLibraryUuid, device.symbolUuid]);
+			const symLibs = dedupe([sysLib, device.symbolLibraryUuid, device.libraryUuid]);
+			let url = await tryGetRenderImage('symbol', symUuids, symLibs);
+			// 短UUID直接渲染失败时，解析库中的可渲染长UUID（Altium 导入器件）
+			if (!url) {
+				const resolved = await resolveRenderableUuid('symbol', device.symbolUuid || device.symbolLibraryUuid);
+				if (resolved)
+					url = await tryGetRenderImage('symbol', [resolved.uuid], [resolved.libraryUuid]);
+			}
+			if (url)
+				result.symbolUrl = url;
+		}
+
+		// 封装：同上
+		if (hasFp) {
+			const fpUuids = dedupe([device.footprintLibraryUuid, device.footprintUuid]);
+			const fpLibs = dedupe([sysLib, device.footprintLibraryUuid, device.libraryUuid]);
+			let url = await tryGetRenderImage('footprint', fpUuids, fpLibs);
+			// 短UUID直接渲染失败时，解析库中的可渲染长UUID（Altium 导入器件）
+			if (!url) {
+				const resolved = await resolveRenderableUuid('footprint', device.footprintUuid || device.footprintLibraryUuid);
+				if (resolved)
+					url = await tryGetRenderImage('footprint', [resolved.uuid], [resolved.libraryUuid]);
+			}
+			if (url)
+				result.footprintUrl = url;
 		}
 
 		return result;
@@ -1379,10 +1506,16 @@
 		if (newTheme !== themePreference) {
 			themePreference = newTheme;
 			if (themePreference === 'auto') {
-				try { lastSystemTheme = await eda.sys_Window.getCurrentTheme(); } catch (e) {}
+				try {
+					lastSystemTheme = await eda.sys_Window.getCurrentTheme();
+				}
+				catch {}
 			}
 			applyTheme();
-			try { await eda.sys_Storage.setExtensionUserConfig('themePreference', themePreference); } catch (e) {}
+			try {
+				await eda.sys_Storage.setExtensionUserConfig('themePreference', themePreference);
+			}
+			catch {}
 		}
 		// 读取降级匹配封装设置
 		fallbackFootprintEnabled = document.getElementById('fallbackFootprint')?.checked || false;
@@ -1405,32 +1538,44 @@
 	async function reDetectBindStatus() {
 		try {
 			const comps = await eda.sch_PrimitiveComponent.getAll('part', true);
-			if (!comps) return;
+			if (!comps)
+				return;
 			for (const comp of comps) {
 				const designator = comp.getState_Designator();
-				if (!designator) continue;
+				if (!designator)
+					continue;
 				const ci = comp.getState_Component();
 				const fp = comp.getState_Footprint();
+				const sym = comp.getState_Symbol();
 				const other = comp.getState_OtherProperty();
 				const hasDevice = !!ci?.uuid;
 				const hasEasyedaFp = !!fp?.uuid;
 				const hasLcsc = !!(other?.LCSC || other?.['Supplier Part'] || other?.['立创编号']);
 				let isBound = false;
-				if (bindDetectMode === 'fp') isBound = hasDevice && hasEasyedaFp;
-				else if (bindDetectMode === 'lcsc') isBound = hasDevice && hasLcsc;
-				else if (bindDetectMode === 'fp_or_lcsc') isBound = hasDevice && (hasEasyedaFp || hasLcsc);
+				if (bindDetectMode === 'fp')
+					isBound = hasDevice && hasEasyedaFp;
+				else if (bindDetectMode === 'lcsc')
+					isBound = hasDevice && hasLcsc;
+				else if (bindDetectMode === 'fp_or_lcsc')
+					isBound = hasDevice && (hasEasyedaFp || hasLcsc);
 				else isBound = hasDevice;
 
 				if (isBound) {
+					const existing = bindStatus[designator]?.deviceInfo || {};
 					bindStatus[designator] = {
 						bound: true,
+						...bindStatus[designator],
 						deviceInfo: {
-							name: ci?.name || '',
-							package: fp?.name || other?.['Origin Footprint'] || '',
-							lcsc: other?.LCSC || other?.['Supplier Part'] || '',
-							manufacturer: other?.Manufacturer || '',
-							libraryUuid: ci?.libraryUuid || '',
-							uuid: ci?.uuid || '',
+							name: ci?.name || existing.name || '',
+							package: fp?.name || other?.['Origin Footprint'] || existing.package || '',
+							lcsc: other?.LCSC || other?.['Supplier Part'] || existing.lcsc || '',
+							manufacturer: other?.Manufacturer || existing.manufacturer || '',
+							libraryUuid: ci?.libraryUuid || existing.libraryUuid || '',
+							uuid: ci?.uuid || existing.uuid || '',
+							symbolUuid: sym?.uuid || existing.symbolUuid || '',
+							symbolLibraryUuid: sym?.libraryUuid || existing.symbolLibraryUuid || '',
+							footprintUuid: fp?.uuid || existing.footprintUuid || '',
+							footprintLibraryUuid: fp?.libraryUuid || existing.footprintLibraryUuid || '',
 						},
 					};
 				}
@@ -2034,12 +2179,18 @@
 
 			// 合并 otherProperty（元数据总是更新）
 			const mergedOther = { ...(saved.otherProperty || {}) };
-			if (deviceInfo.name) mergedOther['LCSC Part Name'] = deviceInfo.name;
-			if (deviceInfo.mpn) mergedOther['Manufacturer Part'] = deviceInfo.mpn;
-			if (deviceInfo.manufacturer) mergedOther.Manufacturer = deviceInfo.manufacturer;
-			if (deviceInfo.lcsc) mergedOther['Supplier Part'] = deviceInfo.lcsc;
-			if (deviceInfo.package) mergedOther['Supplier Footprint'] = deviceInfo.package;
-			if (deviceInfo.description) mergedOther.Description = deviceInfo.description;
+			if (deviceInfo.name)
+				mergedOther['LCSC Part Name'] = deviceInfo.name;
+			if (deviceInfo.mpn)
+				mergedOther['Manufacturer Part'] = deviceInfo.mpn;
+			if (deviceInfo.manufacturer)
+				mergedOther.Manufacturer = deviceInfo.manufacturer;
+			if (deviceInfo.lcsc)
+				mergedOther['Supplier Part'] = deviceInfo.lcsc;
+			if (deviceInfo.package)
+				mergedOther['Supplier Footprint'] = deviceInfo.package;
+			if (deviceInfo.description)
+				mergedOther.Description = deviceInfo.description;
 
 			const modifyParams = {
 				manufacturer: deviceInfo.manufacturer || saved.manufacturer || null,
@@ -2095,8 +2246,10 @@
 			}
 
 			const association = {};
-			if (targetFootprint) association.footprint = targetFootprint;
-			if (targetSymbol) association.symbol = targetSymbol;
+			if (targetFootprint)
+				association.footprint = targetFootprint;
+			if (targetSymbol)
+				association.symbol = targetSymbol;
 
 			const realLib = await resolveDeviceLibrary(compInfo);
 			const modOk = await eda.lib_Device.modify(compInfo.uuid, realLib, undefined, undefined, association);
@@ -2109,8 +2262,13 @@
 			await eda.sch_PrimitiveComponent.delete(primitiveId);
 			const created = await eda.sch_PrimitiveComponent.create(
 				{ libraryUuid: realLib, uuid: compInfo.uuid },
-				saved.x, saved.y, '', saved.rotation, saved.mirror,
-				saved.addIntoBom, saved.addIntoPcb,
+				saved.x,
+				saved.y,
+				'',
+				saved.rotation,
+				saved.mirror,
+				saved.addIntoBom,
+				saved.addIntoPcb,
 			);
 			if (!created) {
 				showToast(i18n('重建器件失败'), 'error');
@@ -2597,6 +2755,14 @@
 					else if (col.key === 'bindStatus') {
 						cells += `<td>${allBound ? `<span class="badge badge-success">${i18n('已绑定')}</span>` : `<span class="badge badge-neutral">${i18n('未绑定')}</span>`}</td>`;
 					}
+					else if (col.key === 'boundPackage') {
+						const boundPkg = g.designatorList.map(d => bindStatus[d]?.deviceInfo?.package || '').find(Boolean) || '';
+						cells += `<td style="font-size:12px;color:${boundPkg ? 'var(--text)' : 'var(--text-muted)'};">${boundPkg || '-'}</td>`;
+					}
+					else if (col.key === 'boundSymbol') {
+						const boundSym = g.designatorList.map(d => bindStatus[d]?.deviceInfo?.name || '').find(Boolean) || '';
+						cells += `<td style="font-size:12px;color:${boundSym ? 'var(--text)' : 'var(--text-muted)'};">${boundSym || '-'}</td>`;
+					}
 					else if (col.key.startsWith('custom_')) {
 						// 自定义 BOM 数据列：从 _raw 中读取
 						const rawKey = col.key.slice(7); // 去掉 'custom_' 前缀
@@ -2751,6 +2917,7 @@
 	// ============ 详情面板 ============
 
 	async function viewDetail(k) {
+		currentDetailKey = k;
 		const g = bomData.find(x => x.designatorList.join(',') === k);
 		if (!g)
 			return;
@@ -2792,7 +2959,7 @@
 
 		// 当前绑定器件（始终展示封装和符号）
 		if (boundDevice) {
-			h += `<div style="margin-top:16px;"><b>${i18n('当前绑定器件')}</b></div>`;
+			h += `<div style="margin-top:16px;display:flex;align-items:center;gap:8px;"><b>${i18n('当前绑定器件')}</b><button class="btn-icon" title="${i18n('重新加载图片')}" onclick="window.__app.reloadRenderImages('bound')" style="font-size:14px;opacity:0.6;">🔄</button></div>`;
 			h += `<div style="display:flex;gap:8px;margin:8px 0;">`;
 			h += `<div style="${cellStyle}"><div style="font-size:11px;color:var(--text-muted);margin-bottom:4px;">${i18n('封装')}</div><div id="fpRenderBound" style="${imgBoxStyle}" onclick="window.__app.previewRender('fpBound')">${genPkgSVG(boundDevice.package || '', 80, 50)}</div></div>`;
 			h += `<div style="${cellStyle}"><div style="font-size:11px;color:var(--text-muted);margin-bottom:4px;">${i18n('符号')}</div><div id="symRenderBound" style="${imgBoxStyle}" onclick="window.__app.previewRender('symBound')">${genSymSVG(boundDevice.name || '', 70, 50)}</div></div>`;
@@ -2805,7 +2972,7 @@
 		// 最佳匹配器件
 		if (best) {
 			const aiTag = mr?.aiRecommended ? i18n(' 🤖 AI推荐') : '';
-			h += `<div style="margin-top:16px;"><b>${i18n('最佳匹配器件')}${aiTag}</b></div>`;
+			h += `<div style="margin-top:16px;display:flex;align-items:center;gap:8px;"><b>${i18n('最佳匹配器件')}${aiTag}</b><button class="btn-icon" title="${i18n('重新加载图片')}" onclick="window.__app.reloadRenderImages('best')" style="font-size:14px;opacity:0.6;">🔄</button></div>`;
 			if (mr?.aiReason) {
 				h += `<div style="padding:10px 12px;background:var(--bg-success);border:1px solid var(--bg-success-border);border-radius:8px;margin:8px 0;font-size:12px;color:var(--text-success);">
 					<b>${i18n('🤖 AI 分析：')}</b>${mr.aiReason}
@@ -2823,10 +2990,12 @@
 			for (const col of matchColumns) {
 				if (valKeywords.some(k => col.toLowerCase().includes(k))) {
 					bomValue = String(g._raw[col] || '');
-					if (bomValue) break;
+					if (bomValue)
+						break;
 				}
 			}
-			if (!bomValue) bomValue = g.value || '';
+			if (!bomValue)
+				bomValue = g.value || '';
 			const fields = [
 				['Value', bomValue || '-'],
 				[i18n('型号'), best.name || best.mpn],
@@ -2880,10 +3049,24 @@
 		panelContent.innerHTML = h;
 
 		// 异步获取渲染图（符号/封装）
-		if (dd && dd.uuid && dd.libraryUuid) {
-			fetchRenderImages(dd).then((imgs) => {
+		if (best && (best.symbolUuid || best.symbolLibraryUuid || best.footprintUuid || best.footprintLibraryUuid)) {
+			fetchRenderImages(best).then((imgs) => {
 				const fpEl = document.getElementById('fpRender');
 				const symEl = document.getElementById('symRender');
+				if (imgs.footprintUrl && fpEl) {
+					fpEl.innerHTML = `<img src="${imgs.footprintUrl}" style="max-width:120px;max-height:80px;object-fit:contain;">`;
+				}
+				if (imgs.symbolUrl && symEl) {
+					symEl.innerHTML = `<img src="${imgs.symbolUrl}" style="max-width:120px;max-height:80px;object-fit:contain;">`;
+				}
+			}).catch(() => {});
+		}
+
+		// 异步获取当前绑定器件的渲染图
+		if (boundDevice && (boundDevice.symbolUuid || boundDevice.symbolLibraryUuid || boundDevice.footprintUuid || boundDevice.footprintLibraryUuid)) {
+			fetchRenderImages(boundDevice).then((imgs) => {
+				const fpEl = document.getElementById('fpRenderBound');
+				const symEl = document.getElementById('symRenderBound');
 				if (imgs.footprintUrl && fpEl) {
 					fpEl.innerHTML = `<img src="${imgs.footprintUrl}" style="max-width:120px;max-height:80px;object-fit:contain;">`;
 				}
@@ -2900,16 +3083,55 @@
 		show(panelEmpty);
 	}
 
+	/** 重新加载渲染图（清除缓存并刷新详情面板） */
+	function reloadRenderImages(type) {
+		if (!currentDetailKey)
+			return;
+		// 清除 renderImageCache 中的相关条目
+		const g = bomData.find(x => x.designatorList.join(',') === currentDetailKey);
+		if (!g)
+			return;
+		const mr = matchResults[currentDetailKey];
+		const best = mr?.bestMatch;
+		const allBound = g.designatorList.some(d => bindStatus[d]?.bound);
+		const boundDevice = allBound ? bindStatus[g.designatorList[0]]?.deviceInfo : null;
+
+		const devices = [];
+		if (type === 'bound' && boundDevice) {
+			devices.push(boundDevice);
+		}
+		else if (type === 'best' && best) {
+			devices.push(best);
+		}
+		else {
+			if (boundDevice)
+				devices.push(boundDevice);
+			if (best)
+				devices.push(best);
+		}
+
+		for (const dev of devices) {
+			const ids = [dev.symbolUuid, dev.symbolLibraryUuid, dev.footprintUuid, dev.footprintLibraryUuid].filter(Boolean);
+			for (const key of Object.keys(renderImageCache)) {
+				if (ids.some(id => key.includes(id)))
+					delete renderImageCache[key];
+			}
+		}
+		viewDetail(currentDetailKey);
+	}
+
 	/** 点击放大预览图片 */
 	function previewImage(url, title) {
-		if (!url) return;
+		if (!url)
+			return;
 		openPreviewModal(`<img src="${url}" style="max-width:100%;max-height:100%;object-fit:contain;" onerror="this.parentElement.innerHTML='<span style=\\'color:var(--text-muted)\\'>${i18n('无图片')}</span>'">`, title || i18n('产品图'));
 	}
 
 	function previewRender(type) {
 		const idMap = { fp: 'fpRender', sym: 'symRender', fpBound: 'fpRenderBound', symBound: 'symRenderBound' };
 		const container = document.getElementById(idMap[type]);
-		if (!container) return;
+		if (!container)
+			return;
 		const svg = container.querySelector('svg');
 		if (!svg) {
 			// 没有 SVG，尝试用整个内容预览
@@ -2920,13 +3142,13 @@
 		}
 		const svgClone = svg.cloneNode(true);
 		// 放大尺寸
-		const origW = parseFloat(svg.getAttribute('width')) || 80;
-		const origH = parseFloat(svg.getAttribute('height')) || 50;
+		const origW = Number.parseFloat(svg.getAttribute('width')) || 80;
+		const origH = Number.parseFloat(svg.getAttribute('height')) || 50;
 		const scale = 4;
 		svgClone.setAttribute('width', origW * scale);
 		svgClone.setAttribute('height', origH * scale);
-		svgClone.style.width = (origW * scale) + 'px';
-		svgClone.style.height = (origH * scale) + 'px';
+		svgClone.style.width = `${origW * scale}px`;
+		svgClone.style.height = `${origH * scale}px`;
 		const title = type === 'fp' ? i18n('封装') : i18n('符号');
 		openPreviewModal(svgClone.outerHTML, title);
 	}
@@ -2950,7 +3172,8 @@
 	function initPreviewInteraction() {
 		const viewport = document.getElementById('previewViewport');
 		const content = document.getElementById('previewContent');
-		if (!viewport || !content) return;
+		if (!viewport || !content)
+			return;
 
 		let scale = 1;
 		let originX = 50; // 百分比
@@ -3161,7 +3384,8 @@
 		const progressBar = $('#progressBar');
 		const progressFill = $('#progressFill');
 		const progressText = $('#progressText');
-		if (progressBar) show(progressBar);
+		if (progressBar)
+			show(progressBar);
 
 		let successCount = 0;
 		const total = g.designatorList.length;
@@ -3169,8 +3393,10 @@
 			const d = g.designatorList[i];
 			// 更新进度
 			const pct = Math.round((i / total) * 100);
-			if (progressFill) progressFill.style.width = `${pct}%`;
-			if (progressText) progressText.textContent = i18n('绑定中 ${1}/${2}', i + 1, total);
+			if (progressFill)
+				progressFill.style.width = `${pct}%`;
+			if (progressText)
+				progressText.textContent = i18n('绑定中 ${1}/${2}', i + 1, total);
 
 			const primitiveId = g._primitiveIds[d] || designatorToPrimitiveId[d];
 			if (!primitiveId) {
@@ -3191,9 +3417,14 @@
 		}
 
 		// 完成进度
-		if (progressFill) progressFill.style.width = '100%';
-		if (progressText) progressText.textContent = i18n('绑定完成');
-		setTimeout(() => { if (progressBar) hide(progressBar); }, 1500);
+		if (progressFill)
+			progressFill.style.width = '100%';
+		if (progressText)
+			progressText.textContent = i18n('绑定完成');
+		setTimeout(() => {
+			if (progressBar)
+				hide(progressBar);
+		}, 1500);
 
 		if (successCount > 0) {
 			renderTable(searchInput.value);
@@ -3218,7 +3449,8 @@
 		const progressBar = $('#progressBar');
 		const progressFill = $('#progressFill');
 		const progressText = $('#progressText');
-		if (progressBar) show(progressBar);
+		if (progressBar)
+			show(progressBar);
 
 		let restoreCount = 0;
 		const total = g.designatorList.length;
@@ -3226,8 +3458,10 @@
 			const d = g.designatorList[i];
 			// 更新进度
 			const pct = Math.round((i / total) * 100);
-			if (progressFill) progressFill.style.width = `${pct}%`;
-			if (progressText) progressText.textContent = i18n('解绑中 ${1}/${2}', i + 1, total);
+			if (progressFill)
+				progressFill.style.width = `${pct}%`;
+			if (progressText)
+				progressText.textContent = i18n('解绑中 ${1}/${2}', i + 1, total);
 			const status = bindStatus[d];
 			if (!status?.bound || !status.originalInfo) {
 				bindStatus[d] = { bound: false, deviceInfo: null };
@@ -3296,9 +3530,14 @@
 		}
 
 		// 完成进度
-		if (progressFill) progressFill.style.width = '100%';
-		if (progressText) progressText.textContent = i18n('解绑完成');
-		setTimeout(() => { if (progressBar) hide(progressBar); }, 1500);
+		if (progressFill)
+			progressFill.style.width = '100%';
+		if (progressText)
+			progressText.textContent = i18n('解绑完成');
+		setTimeout(() => {
+			if (progressBar)
+				hide(progressBar);
+		}, 1500);
 
 		renderTable(searchInput.value);
 		if (!detailPanel.classList.contains('collapsed'))
@@ -3319,7 +3558,8 @@
 		const progressBar = $('#progressBar');
 		const progressFill = $('#progressFill');
 		const progressText = $('#progressText');
-		if (progressBar) show(progressBar);
+		if (progressBar)
+			show(progressBar);
 
 		let count = 0;
 		const total = toBind.length;
@@ -3327,8 +3567,10 @@
 			const d = toBind[i];
 			// 更新进度
 			const pct = Math.round((i / total) * 100);
-			if (progressFill) progressFill.style.width = `${pct}%`;
-			if (progressText) progressText.textContent = i18n('批量绑定 ${1}/${2}', i + 1, total);
+			if (progressFill)
+				progressFill.style.width = `${pct}%`;
+			if (progressText)
+				progressText.textContent = i18n('批量绑定 ${1}/${2}', i + 1, total);
 
 			const g = bomData.find(x => x.designatorList.includes(d));
 			if (!g)
@@ -3352,9 +3594,14 @@
 		}
 
 		// 完成进度
-		if (progressFill) progressFill.style.width = '100%';
-		if (progressText) progressText.textContent = i18n('批量绑定完成');
-		setTimeout(() => { if (progressBar) hide(progressBar); }, 1500);
+		if (progressFill)
+			progressFill.style.width = '100%';
+		if (progressText)
+			progressText.textContent = i18n('批量绑定完成');
+		setTimeout(() => {
+			if (progressBar)
+				hide(progressBar);
+		}, 1500);
 
 		renderTable(searchInput.value);
 		showToast(i18n('✅ 批量绑定完成 ${1}/${2}', count, toBind.length), 'success');
@@ -3920,6 +4167,7 @@
 			onColumnDragEnd,
 			addCustomColumn,
 			removeCustomColumn,
+			reloadRenderImages,
 		};
 		window.editOrBind = editOrBind;
 		window.manualMatch = manualMatch;
@@ -4027,6 +4275,7 @@
 					const fpName = footprintInfo?.name || other?.['Origin Footprint'] || '';
 					const lcscPart = other?.LCSC || other?.['Supplier Part'] || other?.['立创编号'] || '';
 					const mfr = other?.Manufacturer || '';
+					const symbolInfo = comp.getState_Symbol();
 					for (const d of desigs) {
 						preBindStatus[d] = {
 							bound: true,
@@ -4037,6 +4286,10 @@
 								manufacturer: mfr,
 								libraryUuid: componentInfo.libraryUuid || '',
 								uuid: componentInfo.uuid,
+								symbolUuid: symbolInfo?.uuid || '',
+								symbolLibraryUuid: symbolInfo?.libraryUuid || '',
+								footprintUuid: footprintInfo?.uuid || '',
+								footprintLibraryUuid: footprintInfo?.libraryUuid || '',
 							},
 						};
 					}

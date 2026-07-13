@@ -22,6 +22,8 @@
 	"匹配结果": "Match Result",
 	"匹配度": "Score",
 	"绑定": "Bind",
+	"绑定封装": "Bound FP",
+	"绑定符号": "Bound Symbol",
 	"操作": "Action",
 	"未匹配": "Unmatched",
 	"已绑定": "Bound",
@@ -82,6 +84,7 @@
 	"请输入封装关键词": "Please enter footprint keyword",
 	"封装: ${1} | 制造商: ${2}": "Footprint: ${1} | Manufacturer: ${2}",
 	"产品图": "Product",
+	"重新加载图片": "Reload Images",
 	"滚轮缩放 · 拖拽平移": "Scroll to zoom · Drag to pan",
 	"无图片": "No image",
 	"无预览": "No preview",
@@ -222,9 +225,6 @@
 	"解绑完成": "Unbinding Complete",
 	"批量绑定 ${1}/${2}": "Batch Bind ${1}/${2}",
 	"批量绑定完成": "Batch Bind Complete",
-	"正在绑定 ${1}...": "Binding ${1}...",
-	"正在还原器件...": "Restoring components...",
-	"正在批量绑定 ${1} 个器件...": "Batch binding ${1} components...",
 	"全选": "Select All",
 	"完成": "Done"
 }

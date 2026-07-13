@@ -3,7 +3,7 @@
 	"uuid": "b59a8c040a9243209a37281268484a31",
 	"displayName": "AI器件标准化",
 	"description": "AI自动匹配器件信息、符号、封装，支持一键绑定、批量操作",
-	"version": "1.7.1",
+	"version": "1.7.2",
 	"publisher": "",
 	"engines": {
 		"eda": "^3.0.0"
